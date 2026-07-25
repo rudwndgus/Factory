@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+*.tsbuildinfo
+storage/uploads/*
+storage/renders/*
+!storage/uploads/.gitkeep
+!storage/renders/.gitkeep
