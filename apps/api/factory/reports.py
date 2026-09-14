@@ -7,6 +7,34 @@ from .security import secret
 from .config import DATA
 
 
+def employee_report(office_id, video_id, role, heading, topic, summary, details=None):
+    db.put("reports", office_id, dict(kind="employee", role=role, title=f"{role} · {heading}",
+        topic=topic, summary=summary, details=details or [], read=False, video_id=video_id), video_id)
+
+
+def stage_report(office_id, video_id, stage, video):
+    from .config import ROLES
+    roles = [1, 2, 3, 4, 5, 6, 6, 7, 8]
+    sources = [s.get("source_url", "") for s in video.get("sources", [video.get("topic", {})])]
+    scenes = video.get("scenes", [])
+    summaries = [
+        ("소재 선정", "이 주제를 쇼츠 소재로 선정했습니다. 출처를 조사한 뒤 대본을 작성합니다.", sources),
+        ("출처 조사", "원본 출처를 기록했습니다. 일반 제작 영상의 사실 검증은 대표님의 확인이 필요합니다.", sources),
+        ("대본 작성", "아래 내레이션으로 영상을 구성합니다.", video.get("script", {}).get("sentences", [])),
+        ("장면 계획", f"{len(scenes)}개 장면을 계획했습니다. 아래 내용으로 이미지를 제작합니다. 상세 프롬프트는 Review room에서 확인할 수 있습니다.", [f"장면 {i+1}: {s.get('visual_summary', s.get('narration', ''))}" for i,s in enumerate(scenes)]),
+        ("이미지 제작", "장면별 이미지를 준비했습니다. AI 이미지는 실제 촬영 자료가 아닌 시각적 설명입니다.", [f"장면 {i+1}: {s.get('asset_source', 'unknown')} / {s.get('asset_provider', '')}" for i,s in enumerate(scenes)]),
+        ("음성 제작", f"내레이션 생성 완료. 실제 길이 {video.get('actual_duration', 0):.1f}초입니다.", []),
+        ("자막 제작", "장면별 음성 길이에 맞춰 자막을 배치했습니다. 단어별 정밀 정렬은 아닙니다.", []),
+        ("영상 편집", "세로 1080×1920 MP4로 이미지, 음성, 자막을 합쳤습니다. 검수 단계로 전달합니다.", []),
+        ("품질 검수", "검사 결과를 확인하고 Review room에서 영상을 검토해주세요. 테스트 영상은 게시할 수 없습니다.", [f"{k}: {'통과' if v else '차단'}" for k,v in video.get("qc", {}).items()]),
+    ]
+    heading, summary, details = summaries[stage]
+    employee_report(office_id, video_id, ROLES[roles[stage]], heading, video["title"], summary, details)
+    if stage == 8:
+        employee_report(office_id, video_id, "ANALYST / UPLOADER", "게시 인계", video["title"],
+            "테스트이므로 업로드와 성과 수집을 수행하지 않았습니다." if video.get("test_mode") else "대표님의 사실 확인·승인 및 품질 검사 통과 후 게시할 수 있습니다. 아직 업로드하지 않았습니다.")
+
+
 def report(office_id, kind="daily"):
     cutoff = time.time() - (7 if kind == "weekly" else 1) * 86400
     videos = [v for v in db.rows("videos", office_id) if v["created"] >= cutoff]

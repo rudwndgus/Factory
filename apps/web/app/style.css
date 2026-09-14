@@ -1715,3 +1715,11 @@ details pre {
     flex-wrap: wrap;
   }
 }
+/* Authenticated scene review and human-readable employee reports. */
+.scene-review-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 16px; margin: 20px 0; }
+.scene-review-card { border: 1px solid #dbe2d4; border-radius: 12px; overflow: hidden; background: #f8faf4; }
+.scene-review-card img { width: 100%; aspect-ratio: 9/16; object-fit: cover; display: block; }
+.scene-review-card > div { padding: 12px; }
+.scene-review-card p, .readable-report li { overflow-wrap: anywhere; line-height: 1.7; }
+.readable-report h3 { margin-top: 24px; }
+.readable-report li { margin-bottom: 12px; }

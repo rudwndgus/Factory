@@ -1,5 +1,7 @@
 "use client";
 import { useEffect, useState, useRef } from "react";
+import SceneReview from "../components/SceneReview";
+import ReadableReport from "../components/ReadableReport";
 import dynamic from "next/dynamic";
 import {
   Play,
@@ -182,6 +184,11 @@ export default function Page() {
         .register((process.env.NEXT_PUBLIC_BASE_PATH || "") + "/sw.js")
         .catch(() => {});
   }, []);
+  useEffect(() => {
+    if (connected && tab === "Settings") {
+      api("/api/integrations").then(setIntegrations).catch(() => {});
+    }
+  }, [connected, tab]);
   useEffect(() => {
     if (!id) return;
     setSnap(null);
@@ -464,12 +471,15 @@ export default function Page() {
               onClick={() => {
                 if (need())
                   void act(
-                    () => api(root + "/jobs", "POST", { test_mode: true }),
+                    () => {
+                      if (!window.confirm("AI 이미지 5장을 생성하는 테스트입니다. API 비용이 발생하며 업로드는 하지 않습니다. 진행할까요?")) return Promise.resolve();
+                      return api(root + "/jobs", "POST", { test_mode: true, ai_visuals: true });
+                    },
                     "TEST RUN queued. No YouTube publication.",
                   );
               }}
             >
-              <FlaskConical size={16} /> Test run <ArrowUpRight size={14} />
+              <FlaskConical size={16} /> AI Test run <ArrowUpRight size={14} />
             </button>
           </div>
           {error && (
@@ -620,6 +630,7 @@ export default function Page() {
                     employees={snap?.employees || []}
                     reports={reports.length}
                     connected={connected}
+                    mode={office?.mode}
                     onSelect={openEmployee}
                     blocked={!!modal}
                   />
@@ -987,7 +998,8 @@ export default function Page() {
                     >
                       <span className="eyebrow">PIXEL SHORTS FACTORY</span>
                       <FileText size={30} />
-                      <h3>{r.data.kind.toUpperCase()} REPORT</h3>
+                      <h3>{r.data.title || `${r.data.kind.toUpperCase()} REPORT`}</h3>
+                      <p>{r.data.topic || r.data.summary}</p>
                       <p>{new Date(r.created * 1000).toLocaleDateString()}</p>
                       <div />
                       <div />
@@ -1052,6 +1064,7 @@ export default function Page() {
                 </div>
                 {office ? (
                   <OfficeForm
+                    key={office.id}
                     office={office}
                     onSave={(body) =>
                       act(async () => {
@@ -1421,19 +1434,7 @@ export default function Page() {
             ) : modal === "report" ? (
               <>
                 <span className="eyebrow">DELIVERED TO THE CEO DESK</span>
-                <h2>
-                  {reports
-                    .find((r) => r.id === selected)
-                    ?.data.kind.toUpperCase()}{" "}
-                  REPORT
-                </h2>
-                <pre className="report-content">
-                  {JSON.stringify(
-                    reports.find((r) => r.id === selected)?.data,
-                    null,
-                    2,
-                  )}
-                </pre>
+                <ReadableReport report={reports.find((r) => r.id === selected)?.data} />
               </>
             ) : modal === "video" ? (
               <>
@@ -1477,6 +1478,9 @@ export default function Page() {
                         </button>
                       </div>
                     </div>
+                    <SceneReview scenes={detail.scenes || []} root={root + `/videos/${selected}`} regenerate={(scene) => {
+                      void act(async () => { await api(root + `/videos/${selected}/regenerate`, "POST", { stage: 4, scene }); setModal(null); }, "장면 재생성 접수 완료");
+                    }} />
                     <details>
                       <summary>Sources, rights, and research</summary>
                       <pre>
@@ -1720,6 +1724,8 @@ function OfficeForm({
           name: f.get("name"),
           settings: {
             direction: f.get("direction"),
+            visual_source_mode: f.get("visual_source_mode"),
+            visual_style_preset: f.get("visual_style_preset"),
             language: f.get("language"),
             audience: f.get("audience"),
             duration: Number(f.get("duration")),
@@ -1759,6 +1765,15 @@ function OfficeForm({
           required
         />
       </label>
+      <label>Visual Source Mode
+        <select name="visual_source_mode" defaultValue={s?.visual_source_mode || "AI First"}>
+          <option>AI First</option><option>Mixed</option><option>Real First</option>
+        </select>
+      </label>
+      <label>Visual Style Preset
+        <textarea name="visual_style_preset" required maxLength={500} rows={2} defaultValue={s?.visual_style_preset || "cinematic, mysterious, educational, high-contrast, clean, visually striking"} />
+      </label>
+      <p>AI First는 장면별 AI 이미지를 우선 생성합니다. 실제 기록이 필요한 장면은 외부 자료를 사용하며, 생성 실패를 임의 도형으로 대체하지 않습니다.</p>
       <div className="form-grid">
         <label>
           Primary language

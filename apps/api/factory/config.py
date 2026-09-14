@@ -32,6 +32,8 @@ STAGES = [
     "QUALITY_CHECK",
 ]
 DEFAULTS = dict(
+    visual_source_mode="AI First",
+    visual_style_preset="cinematic, mysterious, educational, high-contrast, clean, visually striking",
     direction="Discover something surprising in under one minute.",
     language="English",
     audience="Global curious viewers",

@@ -72,7 +72,7 @@ test("authenticated office reads real state, creates office, persists settings a
   await page.getByRole("button", { name: "Generate daily" }).click();
   await expect(page.locator(".report-paper").first()).toBeVisible();
   await page.locator(".report-paper").first().click();
-  await expect(page.getByRole("dialog")).toContainText("DAILY REPORT");
+  await expect(page.getByRole("dialog")).toContainText("일일 보고서");
   await page.getByRole("button", { name: "Close dialog" }).click();
   await page.getByRole("button", { name: "Office", exact: true }).click();
   await page.getByRole("button", { name: "Start", exact: true }).click();

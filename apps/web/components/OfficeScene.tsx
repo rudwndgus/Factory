@@ -7,6 +7,7 @@ type Props = {
   reports: number;
   onSelect: (role: string) => void;
   connected: boolean;
+  mode?: string;
   blocked?: boolean;
 };
 export default function OfficeScene(props: Props) {
@@ -25,6 +26,8 @@ export default function OfficeScene(props: Props) {
           light: import("phaser").GameObjects.Arc;
           label: import("phaser").GameObjects.Text;
           role: string;
+          homeX: number;
+          homeY: number;
         }[] = [];
         paper!: import("phaser").GameObjects.Text;
         create() {
@@ -198,7 +201,7 @@ export default function OfficeScene(props: Props) {
                 color: "#60664f",
               })
               .setOrigin(0.5);
-            this.people.push({ sprite, light, label: text, role });
+            this.people.push({ sprite, light, label: text, role, homeX: sprite.x, homeY: sprite.y });
           });
           // Sofa, coffee machine, rugs and CEO desk.
           rect(91, 560, 153, 45, 0x698c80);
@@ -262,7 +265,7 @@ export default function OfficeScene(props: Props) {
             const state = current.current.employees.find(
               (e) => e.role === p.role,
             );
-            const active = state?.status === "WORKING";
+            const active = current.current.connected && state?.status === "WORKING" && !["PAUSED", "MAINTENANCE", "EMERGENCY_STOP"].includes(current.current.mode || "");
             p.light.setFillStyle(
               active
                 ? 0x69ae76
@@ -270,7 +273,9 @@ export default function OfficeScene(props: Props) {
                   ? 0xa4af91
                   : 0xadb7ac,
             );
-            p.sprite.setAngle(active ? Math.sin(t / 140) * 3 : 0);
+            p.sprite.setAngle(active ? Math.sin(t / 110) * 6 : 0);
+            p.sprite.setPosition(p.homeX + (active ? Math.sin(t / 650) * 16 : 0), p.homeY + (active ? Math.sin(t / 130) * 3 : 0));
+            p.light.setAlpha(active ? 0.65 + Math.sin(t / 180) * 0.35 : 1);
             p.label.setColor(active ? "#287247" : "#60664f");
           }
           if (this.paper)

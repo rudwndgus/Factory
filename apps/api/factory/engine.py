@@ -19,7 +19,7 @@ LOCK = threading.Lock()
 ROLE_INDEX = [1, 2, 3, 4, 5, 6, 6, 7, 8]
 TEST_SCRIPT = {
     "title": "Why space is silent — TEST RUN",
-    "description": "Offline pipeline test. Original graphic, synthesized narration. Not publishable.",
+    "description": "Educational pipeline test. Visual provenance is recorded per scene. Synthesized narration. Not publishable.",
     "category": "Science / Space",
     "format": "Explanation",
     "hook_style": "Question",
@@ -41,7 +41,7 @@ TEST_SCRIPT = {
 }
 
 
-def enqueue(office_id, test_mode=False, topic_id=None):
+def enqueue(office_id, test_mode=False, topic_id=None, ai_visuals=False):
     office = db.office(office_id)
     if not office:
         raise ValueError("Office not found")
@@ -50,7 +50,7 @@ def enqueue(office_id, test_mode=False, topic_id=None):
     ):
         raise ValueError("Start the Office before queuing production")
     id = db.uid()
-    payload = dict(test_mode=test_mode, topic_id=topic_id, video_id=id)
+    payload = dict(test_mode=test_mode, topic_id=topic_id, video_id=id, ai_visuals=ai_visuals)
     with db.connection() as c:
         c.execute(
             "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -76,6 +76,7 @@ def enqueue(office_id, test_mode=False, topic_id=None):
             "title": "TEST RUN" if test_mode else "Queued production",
             "status": "QUEUED",
             "test_mode": test_mode,
+            "ai_visuals": ai_visuals,
         },
         id,
         id,
@@ -85,6 +86,9 @@ def enqueue(office_id, test_mode=False, topic_id=None):
         "TEST RUN queued (no publishing)" if test_mode else "Production queued",
         video_id=id,
     )
+    from .reports import employee_report
+    employee_report(office_id, id, "EDITOR", "제작 접수", "테스트: Why space is silent" if test_mode else "대기 중인 소재",
+                    (f"{office['settings']['visual_source_mode']} · {office['settings']['visual_style_preset']} 스타일로 세로 쇼츠를 제작합니다. 테스트 영상은 업로드하지 않습니다." if ai_visuals else "오프라인 기술 검사: 비용 없이 도형과 로컬 음성을 사용하며 게시하지 않습니다.") if test_mode else "소재 선정 → 출처 조사 → 대본 → 장면 → 이미지 → 음성/자막 → 편집 → 검수 순서로 진행합니다.")
     return id
 
 
@@ -95,9 +99,11 @@ def set_mode(office_id, mode):
         c.execute("UPDATE offices SET mode=? WHERE id=?", (mode, office_id))
         if mode in ("STOPPED", "EMERGENCY_STOP"):
             c.execute(
-                "UPDATE jobs SET status='CANCELLED',updated=? WHERE office_id=? AND status IN ('QUEUED','RETRYING','WAITING')",
+                "UPDATE jobs SET status='CANCELLED',updated=? WHERE office_id=? AND status IN ('QUEUED','RETRYING','WAITING','RUNNING')",
                 (time.time(), office_id),
             )
+        if mode != "RUNNING":
+            c.execute("UPDATE employee_states SET status=?,updated=? WHERE office_id=?", (mode, time.time(), office_id))
     db.event(
         office_id,
         "Factory mode → " + mode,
@@ -155,6 +161,12 @@ def run_stage(job):
                 0
             ]
         return db.office(office_id)["mode"] == "EMERGENCY_STOP" or status == "CANCELLED"
+
+    def checkpoint():
+        if cancelled():
+            raise InterruptedError("Production stopped")
+        if db.office(office_id)["mode"] in ("PAUSED", "MAINTENANCE"):
+            raise StagePaused("Paused at scene checkpoint")
 
     if stage == 0:
         if test:
@@ -223,7 +235,7 @@ def run_stage(job):
                 scene_number=i + 1,
                 narration=s,
                 subtitle=s,
-                visual_type="TEXT_GRAPHIC",
+                visual_type="SCENE_STILL",
                 visual_query=video["title"],
                 motion_type="zoom",
                 transition="cut",
@@ -233,25 +245,33 @@ def run_stage(job):
             )
             for i, s in enumerate(video["script"]["sentences"])
         ]
+        visuals = video["script"].get("visuals", [])
+        for i, scene in enumerate(scenes):
+            scene.update(assets.visual_plan(scene["narration"], video["title"], settings, i,
+                         visuals[i] if i < len(visuals) else None, space_test=test))
         video["scenes"] = scenes
         for i, s in enumerate(scenes):
             db.put("video_scenes", office_id, s, id, id=f"{id}-{i}")
     elif stage == 4:
         for i, scene in enumerate(video["scenes"]):
-            if cancelled():
-                raise InterruptedError("Media cancelled")
+            checkpoint()
             path = directory / f"image-{i}.png"
             if path.exists():
                 continue
-            # Rights-cleared, original graphics are the guaranteed fallback. No scraped social media.
-            asset = assets.acquire(scene["narration"], path, i, test)
+            if "image_prompt" not in scene:
+                scene.update(assets.visual_plan(scene["narration"], video["title"], settings, i, space_test=test))
+            asset = assets.acquire_scene(scene, path, i, settings, office_id, id,
+                                         offline=test and not payload.get("ai_visuals"))
             asset["path"] = str(path.relative_to(MEDIA))
-            db.put("video_assets", office_id, asset, id)
-            db.put("rights_records", office_id, asset, id)
+            asset["scene_number"] = i + 1
+            scene.update(asset_source=asset["asset_source"], asset_provider=asset["provider"], image_path=asset["path"])
+            db.put("video_assets", office_id, asset, id, id=f"{id}-image-{i}")
+            db.put("rights_records", office_id, asset, id, id=f"{id}-image-{i}")
+            db.put("video_scenes", office_id, scene, id, id=f"{id}-{i}")
+            save()
     elif stage == 5:
         for i, scene in enumerate(video["scenes"]):
-            if cancelled():
-                raise InterruptedError("Voice cancelled")
+            checkpoint()
             path = directory / f"voice-{i}.wav"
             if not path.exists():
                 if test:
@@ -294,6 +314,12 @@ def run_stage(job):
             video_id=id,
         )
     save()
+    from .reports import stage_report
+    stage_report(office_id, id, stage, video)
+
+
+class StagePaused(Exception):
+    pass
 
 
 def tick():
@@ -363,16 +389,18 @@ def tick():
             blocked = isinstance(exc, (ConfigurationRequired, BudgetBlocked))
             cancelled = isinstance(exc, InterruptedError)
             attempts = job["attempts"] + 1
-            status = (
+            status = "WAITING" if isinstance(exc, StagePaused) else (
                 "CANCELLED"
                 if cancelled
                 else "BLOCKED" if blocked else "RETRYING" if attempts < 3 else "FAILED"
             )
+            if isinstance(exc, StagePaused):
+                attempts = 0
             # Do not persist external exception text; it may contain credentials, URLs, or response bodies.
             message = (
                 str(exc)
                 if isinstance(
-                    exc, (ConfigurationRequired, BudgetBlocked, InterruptedError)
+                    exc, (ConfigurationRequired, BudgetBlocked, InterruptedError, StagePaused)
                 )
                 else type(exc).__name__
                 + ": stage failed; inspect configuration or retry"
@@ -402,6 +430,8 @@ def tick():
                 job["id"],
             )
             db.event(job["office_id"], message, "error", job["id"])
+            from .reports import employee_report
+            employee_report(job["office_id"], job["id"], role, "작업 대기/중단", "제작 작업", message)
         finally:
             with db.connection() as c:
                 c.execute(

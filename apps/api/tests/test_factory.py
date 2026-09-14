@@ -1,6 +1,9 @@
 import json
 import time
 import pytest
+import httpx
+import logging
+from urllib.parse import urlparse, parse_qs
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from factory import database as db, engine, reports, security, youtube
@@ -18,6 +21,177 @@ def isolated(tmp_path, monkeypatch):
 
 def first():
     return db.offices()[0]["id"]
+
+
+def test_visual_modes_and_provenance(monkeypatch, tmp_path):
+    from factory import assets
+    settings = db.office(first())["settings"]
+    assert settings["visual_source_mode"] == "AI First"
+    scene = {"narration": "Space is silent"} | assets.visual_plan("Space is silent", "Space", settings, 0, space_test=True)
+    calls = []
+    monkeypatch.setattr(assets.OpenAI, "image", lambda self, prompt, path: calls.append("ai") or {"model": "mock"})
+    monkeypatch.setattr(assets, "acquire", lambda *a, **kw: calls.append("real") or {"provider": "mock-real"})
+    asset = assets.acquire_scene(scene, tmp_path / "a.png", 0, settings, first(), "v")
+    assert calls == ["ai"] and asset["asset_source"] == "ai"
+    assert asset["image_prompt"] and asset["visual_style"]
+    for mode, index in [("Real First", 0), ("Mixed", 1)]:
+        calls.clear()
+        asset = assets.acquire_scene(scene, tmp_path / "a.png", index, settings | {"visual_source_mode": mode}, first(), "v")
+        assert calls == ["real"] and asset["asset_source"] == "external"
+
+
+def test_documentary_never_fabricated(monkeypatch, tmp_path):
+    from factory import assets
+    from factory.providers import ConfigurationRequired
+    settings = db.office(first())["settings"]
+    scene = {"narration": "Official photo"} | assets.visual_plan("Official photo", "NASA", settings, 0, {"requires_real": True})
+    monkeypatch.setattr(assets, "acquire", lambda *a, **kw: None)
+    monkeypatch.setattr(assets.OpenAI, "image", lambda *a: pytest.fail("Must not fabricate documentary image"))
+    with pytest.raises(ConfigurationRequired, match="authentic"):
+        assets.acquire_scene(scene, tmp_path / "a.png", 0, settings, first(), "v")
+
+
+def test_ai_failure_has_no_placeholder_fallback(monkeypatch, tmp_path):
+    from factory import assets
+    from factory.providers import ConfigurationRequired
+    settings = db.office(first())["settings"]
+    scene = {"narration": "Space"} | assets.visual_plan("Space", "Space", settings, 0)
+    def fail(*args):
+        raise ConfigurationRequired("Image model access denied")
+    monkeypatch.setattr(assets.OpenAI, "image", fail)
+    monkeypatch.setattr(assets, "acquire", lambda *a, **kw: pytest.fail("No fallback"))
+    with pytest.raises(ConfigurationRequired):
+        assets.acquire_scene(scene, tmp_path / "a.png", 0, settings, first(), "v")
+
+
+def test_stop_cancels_running_and_employee_reports():
+    id = engine.enqueue(first(), True, ai_visuals=True)
+    assert db.rows("reports", first(), id)[0]["data"]["role"] == "EDITOR"
+    with db.connection() as c:
+        c.execute("UPDATE jobs SET status='RUNNING' WHERE id=?", (id,))
+        c.execute("UPDATE employee_states SET status='WORKING' WHERE office_id=?", (first(),))
+    engine.set_mode(first(), "STOPPED")
+    assert job(id)["status"] == "CANCELLED"
+    with db.connection() as c:
+        assert not c.execute("SELECT 1 FROM employee_states WHERE status='WORKING'").fetchone()
+
+
+def test_visual_settings_survive_migration():
+    with db.connection() as c:
+        settings = db.office(first())["settings"] | {"visual_source_mode": "Real First"}
+        c.execute("UPDATE office_settings SET payload=? WHERE office_id=?", (json.dumps(settings), first()))
+    db.migrate()
+    assert db.office(first())["settings"]["visual_source_mode"] == "Real First"
+
+
+def test_single_scene_regeneration_preserves_other_images(monkeypatch, tmp_path):
+    from factory import editing
+    monkeypatch.setattr(editing, "MEDIA", tmp_path)
+    id = engine.enqueue(first(), True, ai_visuals=True)
+    directory = tmp_path / first() / id
+    directory.mkdir(parents=True)
+    for name in ("image-0.png", "image-1.png", "voice-0.wav", "final.mp4"):
+        (directory / name).write_bytes(b"fixture")
+    db.put("videos", first(), {"id": id, "test_mode": True, "scenes": [{"asset_source": "ai"}, {"asset_source": "ai"}], "file": "old", "qc": {}}, id, id)
+    editing.restart(first(), id, 4, scene=1)
+    assert (directory / "image-0.png").read_bytes() == b"fixture"
+    assert not (directory / "image-1.png").exists()
+    assert (directory / "voice-0.wav").exists()
+    assert not (directory / "final.mp4").exists()
+    assert job(id)["stage"] == 4 and job(id)["status"] == "QUEUED"
+
+
+def test_pause_between_images_keeps_checkpoint(monkeypatch, tmp_path):
+    from factory import assets
+    monkeypatch.setattr(engine, "MEDIA", tmp_path)
+    id = engine.enqueue(first(), True, ai_visuals=True)
+    for _ in range(4):
+        engine.tick()
+    calls = []
+    def image(scene, path, index, *args, **kwargs):
+        calls.append(index)
+        path.write_bytes(b"fixture")
+        engine.set_mode(first(), "PAUSED")
+        return {"asset_source": "ai", "provider": "mock", "rights": "CLEARED"}
+    monkeypatch.setattr(assets, "acquire_scene", image)
+    engine.tick()
+    assert calls == [0]
+    assert job(id)["status"] == "WAITING" and job(id)["stage"] == 4
+    v = next(r["data"] for r in db.rows("videos", first()) if r["id"] == id)
+    assert v["scenes"][0]["asset_source"] == "ai"
+
+
+def oauth_fixture(monkeypatch, channel_status=200, channels=None, refresh=True):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "client-test")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "secret-test")
+    query = parse_qs(urlparse(youtube.oauth_start(first())).query)
+    tokens = {"access_token": "access-test", "expires_in": 3600,
+              "scope": youtube.SCOPES}
+    if refresh:
+        tokens["refresh_token"] = "refresh-test"
+    monkeypatch.setattr(youtube.httpx, "post", lambda *a, **kw: httpx.Response(200, json=tokens))
+    def get(url, **kw):
+        assert kw["headers"]["Authorization"] == "Bearer access-test"
+        if url.endswith("userinfo"):
+            return httpx.Response(200, json={"email": "owner@example.com", "sub": "private-sub"})
+        assert kw["params"] == {"part": "id,snippet,contentDetails", "mine": "true"}
+        return httpx.Response(channel_status, json=channels if channels is not None else {
+            "items": [{"id": "discovered-id", "snippet": {"title": "Discovered channel"}}]})
+    monkeypatch.setattr(youtube.httpx, "get", get)
+    return query
+
+
+def test_oauth_actual_url_and_discovered_channel(monkeypatch, caplog):
+    query = oauth_fixture(monkeypatch)
+    assert set(youtube.REQUIRED_SCOPES.split()) <= set(query["scope"][0].split())
+    assert query["access_type"] == ["offline"]
+    assert query["prompt"] == ["consent"]
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        youtube.callback("code-test", query["state"][0])
+    with db.connection() as c:
+        row = c.execute("SELECT * FROM youtube_connections").fetchone()
+        assert row["channel_id"] == "discovered-id"
+        assert "refresh-test" in security.cipher().decrypt(row["encrypted"].encode()).decode()
+    assert "items=1" in caplog.text and "owner@example.com" in caplog.text
+    for value in ("access-test", "refresh-test", "secret-test", "code-test", "private-sub"):
+        assert value not in caplog.text
+    with pytest.raises(ValueError, match="state invalid"):
+        youtube.callback("code-test", query["state"][0])
+
+
+def test_oauth_google_error_not_hidden_and_redacted(monkeypatch, caplog):
+    query = oauth_fixture(monkeypatch, 403, {"error": {"code": 403,
+        "message": "insufficientPermissions access-test code-test secret-test",
+        "errors": [{"reason": "insufficientPermissions"}]}})
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(ValueError, match="insufficientPermissions") as exc:
+            youtube.callback("code-test", query["state"][0])
+    assert "403" in str(exc.value)
+    for value in ("access-test", "code-test", "secret-test"):
+        assert value not in str(exc.value) + caplog.text
+
+
+def test_oauth_empty_channel_distinct(monkeypatch):
+    query = oauth_fixture(monkeypatch, channels={"items": []})
+    with pytest.raises(ValueError, match="HTTP 200.*0 channels.*owner@example.com"):
+        youtube.callback("code-test", query["state"][0])
+
+
+def test_oauth_missing_refresh_not_saved(monkeypatch):
+    query = oauth_fixture(monkeypatch, refresh=False)
+    with pytest.raises(ValueError, match="no refresh token"):
+        youtube.callback("code-test", query["state"][0])
+    with db.connection() as c:
+        assert c.execute("SELECT count(*) FROM youtube_connections").fetchone()[0] == 0
+
+
+def test_oauth_access_log_hides_query():
+    record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1", "GET", "/api/youtube/oauth/callback?code=code-test&state=state-test", "1.1", 400), None)
+    youtube.OAuthAccessFilter().filter(record)
+    assert "code-test" not in record.getMessage()
+    assert "state-test" not in record.getMessage()
 
 
 def job(id):

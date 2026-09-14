@@ -2,6 +2,22 @@
 
 **웹앱: [https://rudwndgus.github.io/Factory/](https://rudwndgus.github.io/Factory/)** · [소스 코드](https://github.com/rudwndgus/Factory)
 
+## Curiosity Room · AI 이미지 제작
+
+- Settings의 **Visual Source Mode**: `AI First`(기본), `Mixed`, `Real First`.
+- **Visual Style Preset** 기본값: cinematic, mysterious, educational, high-contrast, clean, visually striking.
+- AI First는 장면별 AI 이미지를 먼저 생성합니다. 실제 인물·공식 뉴스·정확한 제품·공식 사진 등 실제 자료가 필요한 장면은 외부 자료를 요구합니다. 실제 자료를 못 찾으면 AI로 사실을 위조하지 않고 차단합니다.
+- Mixed는 실자료 필수 장면 외에 장면 순서에 따라 AI/실자료 우선순위를 번갈아 적용합니다. Real First는 실자료를 먼저 찾고, 필수 실자료 장면이 아닐 때만 AI로 전환합니다.
+- 기본 이미지 모델은 `IMAGE_MODEL=gpt-image-2`, 1024×1536 medium 이미지에서 9:16 중앙 크롭합니다. 이미지당 예약액은 `IMAGE_CALL_RESERVATION_USD=0.20`(실청구액 아님). 예산·모델 권한·결제 오류 시 임의 도형으로 대체하지 않습니다.
+- 웹앱의 **AI Test run**은 5개 장면의 실제 유료 이미지 생성 + 로컬 음성으로 `Why space is silent`를 만듭니다. 비용 확인창을 거치며 **업로드는 금지**됩니다. 기존 `scripts/test_run.py`는 무료 오프라인 기술 검사로 남겨둡니다.
+- Review room에서 장면별 AI/외부 출처, 프롬프트, 스타일을 확인하고 이미지를 개별 재생성할 수 있습니다. 재생성은 비용이 발생하고 MP4·QC를 다시 만듭니다.
+- 직원별 작업 보고서는 Reports에 한국어 주제·수행 내용·장면 계획·검사 결과로 쌓입니다. 실제 작업 중인 직원만 움직이며, 중단 시 새 작업과 움직임을 멈춥니다. 이미 전송한 외부 요청은 즉시 취소/환불할 수 없습니다.
+
+### 휴대폰과 회사 PC 서버
+
+GitHub 웹앱은 모바일 화면을 지원하지만 휴대폰의 `localhost`는 회사 PC가 아닙니다. **회사 PC를 켜놓기만 해서는 외부 접속이 되지 않습니다.** 현재 서버는 `127.0.0.1:8000`으로 로컬에만 바인딩되어 있습니다.
+회사 IT의 허가를 받은 VPN/보안 원격 연결 또는 인증된 HTTPS 서버가 필요합니다. 회사 네트워크의 포트 개방/터널 설치는 별도 승인 후 진행하세요. PC 절전·재부팅·인터넷 단절 시 제작은 중단됩니다. API 키와 `.env`, `data`를 GitHub에 올리지 마세요.
+
 작은 픽셀 사무실로 관리하는 실제 Shorts 제작 서버입니다. 각 사무실은 하나의 채널 작업공간이며, 직원의 상태는 SQLite에 저장된 제작 작업에서 갱신됩니다. Next.js 웹앱과 Python/FastAPI 제작 서버를 분리했습니다.
 
 > **접속 안내:** 위 GitHub Pages 주소는 웹 클라이언트입니다. GitHub Pages에서는 Python·SQLite·FFmpeg 서버를 실행할 수 없습니다. 최초 접속 시 **Connect your server**에서 로컬 또는 HTTPS로 배포한 제작 서버 주소와 owner 비밀번호를 입력하세요. 서버가 연결되지 않으면 OFFLINE과 빈 상태가 표시됩니다. 작업/계정/영상이 기기 사이에 공유되려면 같은 상시 실행 서버에 연결해야 합니다.
@@ -63,9 +79,9 @@ npm run dev
 
 ## 첫 TEST RUN
 
-서버 연결 → Office → **Test run** → Production에서 단계 확인 → Video library에서 결과 확인/다운로드.
+서버 연결 → Office → **AI Test run** → 비용 확인 → Production에서 단계 확인 → Video library에서 결과 확인/다운로드.
 
-TEST RUN은 고정된 교육용 테스트 대본, 실제 오프라인 합성 음성, 자체 그래픽으로 MP4를 만듭니다. 테스트 데이터는 `test_mode`로 영속 저장되고 **절대 업로드할 수 없습니다**. 화면에 가짜 조회수나 가짜 업로드 성공이 추가되지 않습니다.
+웹앱의 AI TEST RUN은 고정된 교육용 대본, 실제 AI 이미지, 로컬 합성 음성으로 MP4를 만듭니다. 아래 오프라인 CLI 검사는 자체 그래픽을 사용합니다. 두 테스트 모두 `test_mode`로 저장되고 **절대 업로드할 수 없습니다**. 가짜 조회수나 가짜 업로드 성공을 추가하지 않습니다.
 
 자동화 검증용:
 
@@ -131,7 +147,7 @@ Settings → Integrations에서 `OPENAI_API_KEY` 저장 → Test로 인증 검�
 
 ## 이미지·음악·저장소
 
-- V1 자동 외부 이미지는 Wikimedia의 명시적 CC0/Public domain 기록 또는 설정된 Pexels를 사용합니다. 실패하면 원본 설명 그래픽으로 전환합니다.
+- 자동 외부 이미지는 Wikimedia의 명시적 CC0/Public domain 기록 또는 설정된 Pexels를 사용합니다. AI First는 실자료 필수 장면을 제외하고 AI 이미지를 먼저 생성합니다. AI 생성 실패를 그래픽으로 대체하지 않습니다. 자체 도형은 명시적 오프라인 기술 검사에만 사용합니다.
 - 외부 이미지와 라이선스/출처 기록을 영상에 연결합니다. 사용자 교체 이미지는 기본 UNSAFE로 처리합니다.
 - `media_library/music`와 `media_library/sfx`에 오디오와 같은 이름의 JSON 라이선스 파일을 추가할 수 있습니다. 예: `ambient.mp3` + `ambient.json`.
 - `rights: CLEARED`와 `license`가 없는 트랙은 선택되지 않습니다. 음악은 낮은 볼륨으로 믹싱합니다.
@@ -173,7 +189,7 @@ npx playwright test
 
 - 사실 검증은 수집 증거 + 구조화된 주장 + CEO 확인입니다. 독립 다중 출처 자동 교차 검증과 의미 임베딩 중복 탐지는 후속 작업입니다.
 - 후보 점수 중 수집하지 않은 신호는 null입니다. 조회수/트렌드 점수/수익을 만들지 않습니다. 카테고리 비중은 저장되지만 적응형 샘플링/자동 전략 변경은 미구현입니다.
-- 이미지 선택은 Commons/Pexels/로컬 그래픽으로 제한됩니다. NASA/NOAA/USGS 전문 미디어 어댑터, AI 이미지 폴백, R2는 후속 작업입니다.
+- AI 이미지 생성과 Commons/Pexels 선택을 지원합니다. NASA/NOAA/USGS 전문 미디어 어댑터, 생성 이미지의 자동 사실 검증, R2는 후속 작업입니다. AI 생성 표시와 출처 기록은 법적 권리나 시각적 정확성을 보증하지 않습니다.
 - TTS는 장면별 실제 음성 길이로 자막 시간을 분할합니다. 단어별 forced alignment와 키워드 하이라이트는 미구현입니다.
 - 렌더러는 줌/중앙 crop/컷/자막/음량 정규화/선택적 음악·SFX를 지원합니다. 패럴랙스, 다양한 전환, 스마트 피사체 crop은 후속 작업입니다.
 - 일부 장면 교체 기능은 API로 제공되며 관리 UI의 세부 이미지/권리 편집과 로그 고급 필터는 추가 작업이 필요합니다.

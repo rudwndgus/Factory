@@ -32,6 +32,8 @@ def restart(office_id, video_id, stage, scene=None, sentences=None, replacement=
             targets.append(f"scene-{i}.mp4")
             if stage <= 4 and (scene is None or i == scene):
                 targets.append(f"image-{i}.png")
+                for key in ("asset_source", "asset_provider", "image_path"):
+                    v["scenes"][i].pop(key, None)
             if stage <= 5 and stage != 4 and (scene is None or i == scene):
                 targets.append(f"voice-{i}.wav")
         for name in targets:

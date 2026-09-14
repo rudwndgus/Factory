@@ -3,13 +3,63 @@ import os
 import secrets
 import time
 import threading
+import logging
+import re
 from functools import wraps
 from urllib.parse import urlencode
 import httpx
 from . import database as db
 from .security import cipher, digest, secret
 
-SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly"
+REQUIRED_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly"
+SCOPES = REQUIRED_SCOPES + " openid email"
+logger = logging.getLogger("uvicorn.error")
+
+
+class OAuthAccessFilter(logging.Filter):
+    def filter(self, record):
+        # Uvicorn otherwise writes the authorization code in the callback query.
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            args = list(record.args)
+            if str(args[2]).split("?")[0] == "/api/youtube/oauth/callback":
+                args[2] = "/api/youtube/oauth/callback"
+                record.args = tuple(args)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(OAuthAccessFilter())
+
+
+def sanitized(value, sensitive=()):
+    if isinstance(value, dict):
+        return {k: ("[REDACTED]" if k.lower() in {
+            "access_token", "refresh_token", "id_token", "client_secret",
+            "authorization", "authorization_code", "code_verifier",
+        } else sanitized(v, sensitive)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitized(v, sensitive) for v in value]
+    if isinstance(value, str):
+        for item in sensitive:
+            if item:
+                value = value.replace(item, "[REDACTED]")
+        return re.sub(r"(?i)(Bearer\s+|(?:access_token|refresh_token|client_secret|code)=)[^\s&\"<>]+", r"\1[REDACTED]", value)
+    return value
+
+
+def google_json(response, operation, sensitive=(), log_response=False):
+    try:
+        body = response.json()
+    except ValueError:
+        raise ValueError(f"{operation}: Google returned HTTP {response.status_code}, non-JSON response") from None
+    safe = sanitized(body, sensitive)
+    if log_response:
+        logger.info("%s HTTP %s items=%s response=%s", operation,
+                    response.status_code, len(body.get("items", [])), json.dumps(safe, ensure_ascii=True))
+    if response.status_code != 200 or body.get("error"):
+        # Never expose the token response itself, only Google's sanitized error.
+        detail = {k: safe[k] for k in ("error", "error_description") if k in safe}
+        raise ValueError(f"{operation}: Google HTTP {response.status_code}: {json.dumps(detail, ensure_ascii=True)}")
+    return body
 UPLOAD_LOCK = threading.Lock()
 
 
@@ -71,19 +121,44 @@ def callback(code, state):
         ),
         timeout=30,
     )
-    if r.status_code != 200:
-        raise ValueError("Google token exchange failed")
-    tokens = r.json()
+    sensitive = [code, secret("GOOGLE_CLIENT_SECRET")]
+    tokens = google_json(r, "OAuth token exchange", sensitive)
+    sensitive += [tokens.get(k, "") for k in ("access_token", "refresh_token", "id_token")]
+    if not tokens.get("access_token"):
+        raise ValueError("Google token exchange returned no access token; reconnect")
     tokens["expires_at"] = time.time() + tokens.get("expires_in", 3600)
+    headers = {"Authorization": "Bearer " + tokens["access_token"]}
+    email = None
+    try:
+        identity = httpx.get("https://openidconnect.googleapis.com/v1/userinfo",
+                             headers=headers, timeout=30)
+        if identity.status_code == 200:
+            email = identity.json().get("email")
+            logger.info("YouTube OAuth authenticated email=%s", sanitized(email, sensitive))
+        else:
+            logger.info("YouTube OAuth identity unavailable HTTP %s", identity.status_code)
+    except (httpx.HTTPError, ValueError):
+        logger.info("YouTube OAuth identity unavailable (request failed)")
     r = httpx.get(
         "https://www.googleapis.com/youtube/v3/channels",
-        headers={"Authorization": "Bearer " + tokens["access_token"]},
-        params=dict(part="snippet", mine="true"),
+        headers=headers,
+        params=dict(part="id,snippet,contentDetails", mine="true"),
         timeout=30,
     )
-    if r.status_code != 200 or not r.json().get("items"):
-        raise ValueError("Google account has no accessible YouTube channel")
-    channel = r.json()["items"][0]
+    result = google_json(r, "YouTube channels.list(mine=true)", sensitive, log_response=True)
+    if "scope" in tokens:
+        missing = set(REQUIRED_SCOPES.split()) - set(tokens["scope"].split())
+        if missing:
+            raise ValueError("Google did not grant required scopes: " + ", ".join(sorted(missing)) + "; reconnect and approve all requested permissions")
+    if not result.get("items"):
+        raise ValueError("YouTube channels.list succeeded (HTTP 200) but returned 0 channels for "
+                         + (sanitized(email, sensitive) or "the authenticated account")
+                         + ". Reconnect and select the account/channel that owns your YouTube channel.")
+    if len(result["items"]) != 1 or result.get("nextPageToken"):
+        raise ValueError("Google returned multiple channels; reconnect selecting the intended YouTube channel")
+    if not tokens.get("refresh_token"):
+        raise ValueError("Google returned no refresh token. Remove this app's Google account access and reconnect with consent; existing connection was not changed.")
+    channel = result["items"][0]
     encrypted = cipher().encrypt(json.dumps(tokens).encode()).decode()
     with db.connection() as c:
         c.execute(

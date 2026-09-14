@@ -97,6 +97,10 @@ class OfficeInput(BaseModel):
             raise ValueError("Invalid duplicate threshold")
         if s["privacy"] not in ("private", "unlisted", "public"):
             raise ValueError("Invalid privacy")
+        if s["visual_source_mode"] not in ("AI First", "Mixed", "Real First"):
+            raise ValueError("Invalid visual source mode")
+        if not isinstance(s["visual_style_preset"], str) or not 1 <= len(s["visual_style_preset"]) <= 500:
+            raise ValueError("Visual style must be 1–500 characters")
         return self
 
 
@@ -121,6 +125,7 @@ class TopicInput(BaseModel):
 
 class JobInput(BaseModel):
     test_mode: bool = False
+    ai_visuals: bool = False
     topic_id: str | None = None
 
 
@@ -291,7 +296,7 @@ async def events(id: str, request: Request):
 @app.post("/api/offices/{id}/jobs", dependencies=[Depends(require_owner)])
 def queue(id: str, body: JobInput):
     exists(id)
-    return {"id": engine.enqueue(id, body.test_mode, body.topic_id)}
+    return {"id": engine.enqueue(id, body.test_mode, body.topic_id, body.ai_visuals)}
 
 
 @app.post(
@@ -387,6 +392,17 @@ def regenerate(id: str, video_id: str, body: RegenerateInput):
         )
     restart(id, video_id, body.stage, body.scene, body.sentences)
     return {"ok": True}
+
+
+@app.get("/api/offices/{id}/videos/{video_id}/scenes/{scene}/image", dependencies=[Depends(require_owner)])
+def scene_image(id: str, video_id: str, scene: int):
+    v = video(id, video_id)
+    if not 0 <= scene < len(v.get("scenes", [])):
+        raise HTTPException(404, "Scene not found")
+    path = (MEDIA / id / video_id / f"image-{scene}.png").resolve()
+    if not path.is_relative_to(MEDIA.resolve()) or not path.is_file():
+        raise HTTPException(404, "Scene image not available")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.post(
