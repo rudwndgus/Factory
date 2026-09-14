@@ -1,0 +1,1 @@
+The backend OpenAPI schema at `/openapi.json` is the request/response contract. Frontend display interfaces live in `apps/web/lib/api.ts`. Office IDs scope every content endpoint; provider credentials and refresh tokens never appear in API responses.

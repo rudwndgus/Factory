@@ -1,0 +1,12 @@
+:80 {
+ handle /api/* {
+  reverse_proxy api:8000 {
+   flush_interval -1
+  }
+ }
+ handle {
+  root * /srv
+  try_files {path} {path}.html /index.html
+  file_server
+ }
+}

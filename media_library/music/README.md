@@ -1,0 +1,1 @@
+Add only rights-cleared tracks. Each track needs a same-name JSON sidecar: `{ "license": "your license", "author": "creator", "source_url": "https://...", "rights": "CLEARED", "tags": ["science"], "attribution": "..." }`. Files without clearance are not selected.
