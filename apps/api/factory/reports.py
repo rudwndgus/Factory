@@ -107,7 +107,8 @@ def inspect(office_id):
         checks["ffmpeg"] = True
     except Exception:
         checks["ffmpeg"] = False
-    for name in ["OPENAI_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "PEXELS_API_KEY"]:
+    for name in ["OPENAI_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+                 "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "PEXELS_API_KEY"]:
         try:
             checks[name] = "configured (not validated)" if secret(name) else "not configured"
         except Exception:

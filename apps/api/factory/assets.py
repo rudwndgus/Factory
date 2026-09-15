@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 import httpx
 from PIL import Image
-from .providers import Pexels, OpenAI, ConfigurationRequired
+from .providers import Pexels, ConfigurationRequired, generate_image
 from . import media
 
 
@@ -156,8 +156,8 @@ def acquire_scene(scene, path, index, settings, office_id, video_id, offline=Fal
             return external | metadata | {"asset_source": "external", "review_note": "Verify source identity and visual relevance before publication."}
         if real_required:
             raise ConfigurationRequired("Scene requires authentic external imagery. No suitable source was found; revise the scene or provide a verified image. AI substitution blocked.")
-    generated = OpenAI(office_id, video_id).image(scene["image_prompt"], path)
-    return generated | metadata | dict(asset_source="ai", provider="OpenAI Images", source_url=None,
+    generated = generate_image(scene["image_prompt"], path, office_id, video_id, settings)
+    return generated | metadata | dict(asset_source="ai", provider=generated["provider"], source_url=None,
         license="AI-generated illustration (not documentary evidence)", rights="CLEARED", author="AI generated",
         retrieved_at=time.time(), usage_status="selected", review_note="Owner must review accuracy and third-party rights; AI origin does not guarantee clearance.")
 

@@ -8,7 +8,7 @@
 - **Visual Style Preset** 기본값: cinematic, mysterious, educational, high-contrast, clean, visually striking.
 - AI First는 장면별 AI 이미지를 먼저 생성합니다. 실제 인물·공식 뉴스·정확한 제품·공식 사진 등 실제 자료가 필요한 장면은 외부 자료를 요구합니다. 실제 자료를 못 찾으면 AI로 사실을 위조하지 않고 차단합니다.
 - Mixed는 실자료 필수 장면 외에 장면 순서에 따라 AI/실자료 우선순위를 번갈아 적용합니다. Real First는 실자료를 먼저 찾고, 필수 실자료 장면이 아닐 때만 AI로 전환합니다.
-- 기본 이미지 모델은 `IMAGE_MODEL=gpt-image-2`, 1024×1536 medium 이미지에서 9:16 중앙 크롭합니다. 이미지당 예약액은 `IMAGE_CALL_RESERVATION_USD=0.20`(실청구액 아님). 예산·모델 권한·결제 오류 시 임의 도형으로 대체하지 않습니다.
+- 기본 이미지 공급자는 Cloudflare Workers AI `FLUX.1 Schnell`(4 steps)이며, OpenAI 이미지는 선택적 fallback입니다. 모든 공급자 결과는 렌더링용 PNG로 정규화합니다. 예산·모델 권한·결제 오류 시 임의 도형으로 대체하지 않습니다.
 - 웹앱의 **AI Test run**은 5개 장면의 실제 유료 이미지 생성 + 로컬 음성으로 `Why space is silent`를 만듭니다. 비용 확인창을 거치며 **업로드는 금지**됩니다. 기존 `scripts/test_run.py`는 무료 오프라인 기술 검사로 남겨둡니다.
 - Review room에서 장면별 AI/외부 출처, 프롬프트, 스타일을 확인하고 이미지를 개별 재생성할 수 있습니다. 재생성은 비용이 발생하고 MP4·QC를 다시 만듭니다.
 - 영상마다 보고서 한 장이 생성되고, 그 안에 10개 부서의 수행 내용과 특이사항이 계속 정리됩니다. 대표가 **확인 완료**를 누르면 보고서는 정리함으로 이동합니다. 작업이 진행되는 동안 사무실 직원 전체가 움직이고, 일시정지·중단 시 멈춥니다. 이미 전송한 외부 요청은 즉시 취소/환불할 수 없습니다.
@@ -101,6 +101,31 @@ $env:PYTHONPATH='apps/api'
 ```
 
 이 명령은 별도의 `Acceptance TEST RUN` 사무실을 만들고 결과 경로를 출력합니다. 기존 서버의 worker와 동시에 돌리지 말고 서버를 정지한 상태에서 실행하세요.
+
+## Cloudflare FLUX 이미지 설정
+
+Curiosity Room의 기본 이미지 공급자는 Cloudflare Workers AI의 `@cf/black-forest-labs/flux-1-schnell`입니다. OpenAI 이미지는 fallback으로 선택했을 때만 호출됩니다.
+
+1. [Cloudflare Workers AI REST API 안내](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)에서 Cloudflare Dashboard → Workers AI → **Use REST API**로 이동합니다.
+2. **Create a Workers AI API Token**을 눌러 토큰을 생성합니다. 직접 권한을 지정하면 Account의 `Workers AI - Read`와 `Workers AI - Edit` 권한이 모두 필요합니다.
+3. 같은 화면의 **Get Account ID**에서 Account ID를 복사합니다. [Account ID 찾기 안내](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/)도 참고할 수 있습니다.
+4. 웹앱의 Settings → Integrations에서 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`을 각각 저장합니다. 값은 서버에서 암호화되며 화면이나 로그에 다시 표시되지 않습니다.
+5. Office settings에서 Primary image provider를 Cloudflare Workers AI로 저장한 뒤 **Test image provider**를 눌러 샘플 한 장과 실제 공급자·모델을 확인합니다.
+
+`.env`를 직접 사용하는 경우:
+
+```dotenv
+IMAGE_PROVIDER=cloudflare
+CLOUDFLARE_ACCOUNT_ID=your-account-id
+CLOUDFLARE_API_TOKEN=your-workers-ai-token
+CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-1-schnell
+CLOUDFLARE_IMAGE_STEPS=4
+CLOUDFLARE_IMAGE_FORMAT=jpg
+IMAGE_FALLBACK_PROVIDER=openai
+IMAGE_PROVIDER_TIMEOUT_SECONDS=60
+```
+
+기본 장면 수 상한은 영상당 5장입니다. 5–8개 내레이션 문장을 4–5개 연속 장면으로 묶고 각 이미지를 FFmpeg 줌·팬으로 여러 초간 사용합니다. 공급자 테스트도 실제 이미지 한 장을 생성하므로 Cloudflare 사용량에 포함될 수 있습니다. 무료 할당량/쿼터가 소진되면 명확한 오류를 표시하며, fallback이 활성화된 경우에만 OpenAI를 시도합니다.
 
 ## OpenAI 설정
 

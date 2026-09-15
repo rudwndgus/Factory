@@ -127,6 +127,8 @@ export default function Page() {
     [playback, setPlayback] = useState(""),
     [hq, setHq] = useState(false),
     [reportShelf, setReportShelf] = useState<"inbox" | "archive">("inbox");
+  const [imageProviderTest, setImageProviderTest] = useState<any>(null);
+  const [showTestVideos, setShowTestVideos] = useState(false);
   const [server, setServer] = useState("http://localhost:8000"),
     [password, setPassword] = useState("");
   const controller = useRef<AbortController | null>(null);
@@ -145,6 +147,9 @@ export default function Page() {
   const activeEmployees = (snap?.employees || []).filter(
     (employee) => employee.status === "WORKING",
   );
+  const productionVideos = videos.filter((video) => !video.data.test_mode);
+  const testVideos = videos.filter((video) => video.data.test_mode);
+  const visibleVideos = showTestVideos ? testVideos : productionVideos;
   const today = new Date().toISOString().slice(0, 10);
   const costs = snap?.cost_events || [];
   const dailyCost = costs
@@ -490,7 +495,7 @@ export default function Page() {
                   void act(() => {
                     if (
                       !window.confirm(
-                        "AI 이미지 5장을 생성하는 테스트입니다. API 비용이 발생하며 업로드는 하지 않습니다. 진행할까요?",
+                        `${office?.settings.image_provider || "cloudflare"} 공급자로 AI 이미지 최대 ${office?.settings.max_images_per_short || 5}장을 생성하는 고정 주제 테스트입니다. Fallback은 ${office?.settings.image_fallback_provider || "none"}이며, OpenAI로 설정하면 Cloudflare 실패 시 OpenAI 비용이 발생할 수 있습니다. 새 TEST 영상이 하나 저장되며 업로드하지 않습니다. 진행할까요?`,
                       )
                     )
                       return Promise.resolve();
@@ -962,11 +967,24 @@ export default function Page() {
             <section className="panel list-panel">
               <div className="section-head">
                 <h2>Video library</h2>
-                <span>{videos.length} productions</span>
+                <div className="toolbar">
+                  <button
+                    className={"btn " + (!showTestVideos ? "primary" : "")}
+                    onClick={() => setShowTestVideos(false)}
+                  >
+                    Productions {productionVideos.length}
+                  </button>
+                  <button
+                    className={"btn " + (showTestVideos ? "primary" : "")}
+                    onClick={() => setShowTestVideos(true)}
+                  >
+                    Test runs {testVideos.length}
+                  </button>
+                </div>
               </div>
-              {videos.length ? (
+              {visibleVideos.length ? (
                 <div className="video-cards">
-                  {videos.map((v) => (
+                  {visibleVideos.map((v) => (
                     <button
                       key={v.id}
                       className="video-card"
@@ -991,8 +1009,16 @@ export default function Page() {
                 </div>
               ) : (
                 <Empty
-                  title="Your first Short starts here."
-                  text="Completed videos include narration, subtitles, original graphics, and a real downloadable MP4."
+                  title={
+                    showTestVideos
+                      ? "No provider test videos yet."
+                      : "Your first real Short starts here."
+                  }
+                  text={
+                    showTestVideos
+                      ? "AI Test run creates the fixed Why space is silent example and never uploads it."
+                      : "TEST RUN results are kept in the separate Test runs shelf."
+                  }
                 />
               )}
             </section>
@@ -1131,6 +1157,8 @@ export default function Page() {
                   </div>
                   {[
                     "OPENAI_API_KEY",
+                    "CLOUDFLARE_ACCOUNT_ID",
+                    "CLOUDFLARE_API_TOKEN",
                     "GOOGLE_CLIENT_ID",
                     "GOOGLE_CLIENT_SECRET",
                     "PEXELS_API_KEY",
@@ -1179,6 +1207,65 @@ export default function Page() {
                         )}
                     </div>
                   ))}
+                  {office && (
+                    <div className="provider-test">
+                      <div>
+                        <b>Image provider test</b>
+                        <small>
+                          Primary: {office.settings.image_provider} · Model: {office.settings.cloudflare_image_model}
+                        </small>
+                      </div>
+                      <button
+                        className="btn"
+                        disabled={busy}
+                        onClick={() =>
+                          void act(async () => {
+                            if (
+                              !window.confirm(
+                                "Primary 공급자만 사용해 샘플 이미지 1장을 생성합니다. 이 테스트에서는 OpenAI fallback을 호출하지 않습니다. 공급자 사용량이 발생할 수 있습니다. 진행할까요?",
+                              )
+                            )
+                              return;
+                            const result = await api(
+                              "/api/system/test-image-provider",
+                              "POST",
+                              { office_id: id },
+                            );
+                            const c = config();
+                            const response = await fetch(
+                              c.url + result.preview_url,
+                              { headers: { Authorization: `Bearer ${c.token}` } },
+                            );
+                            if (!response.ok)
+                              throw new Error("Provider preview unavailable");
+                            const preview = URL.createObjectURL(
+                              await response.blob(),
+                            );
+                            setImageProviderTest((old: any) => {
+                              if (old?.preview) URL.revokeObjectURL(old.preview);
+                              return { ...result, preview };
+                            });
+                          }, "Image provider test completed")
+                        }
+                      >
+                        Test image provider
+                      </button>
+                      {imageProviderTest && (
+                        <div className="provider-test-result">
+                          <img
+                            src={imageProviderTest.preview}
+                            alt="Image provider test preview"
+                          />
+                          <p>
+                            {imageProviderTest.provider} · {imageProviderTest.model}
+                            {imageProviderTest.fallback_from
+                              ? ` · fallback from ${imageProviderTest.fallback_from}`
+                              : ""}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </section>
                 <section className="panel list-panel youtube-panel">
                   <div className="section-head">
@@ -1799,6 +1886,13 @@ function OfficeForm({
             direction: f.get("direction"),
             visual_source_mode: f.get("visual_source_mode"),
             visual_style_preset: f.get("visual_style_preset"),
+            image_provider: f.get("image_provider"),
+            image_fallback_provider: f.get("image_fallback_provider"),
+            cloudflare_image_model: f.get("cloudflare_image_model"),
+            cloudflare_image_steps: Number(f.get("cloudflare_image_steps")),
+            image_seed_mode: f.get("image_seed_mode"),
+            image_fixed_seed: Number(f.get("image_fixed_seed")),
+            max_images_per_short: Number(f.get("max_images_per_short")),
             language: f.get("language"),
             audience: f.get("audience"),
             duration: Number(f.get("duration")),
@@ -1866,6 +1960,83 @@ function OfficeForm({
         AI First는 장면별 AI 이미지를 우선 생성합니다. 실제 기록이 필요한 장면은
         외부 자료를 사용하며, 생성 실패를 임의 도형으로 대체하지 않습니다.
       </p>
+      <fieldset>
+        <legend>AI image provider</legend>
+        <div className="form-grid">
+          <label>
+            Primary image provider
+            <select
+              name="image_provider"
+              defaultValue={s?.image_provider || "cloudflare"}
+            >
+              <option value="cloudflare">Cloudflare Workers AI</option>
+              <option value="openai">OpenAI Images</option>
+            </select>
+          </label>
+          <label>
+            Fallback image provider
+            <select
+              name="image_fallback_provider"
+              defaultValue={s?.image_fallback_provider || "openai"}
+            >
+              <option value="openai">OpenAI Images</option>
+              <option value="cloudflare">Cloudflare Workers AI</option>
+              <option value="none">Disabled</option>
+            </select>
+          </label>
+          <label>
+            Model
+            <input
+              name="cloudflare_image_model"
+              defaultValue={
+                s?.cloudflare_image_model ||
+                "@cf/black-forest-labs/flux-1-schnell"
+              }
+              required
+            />
+          </label>
+          <label>
+            Steps
+            <input
+              name="cloudflare_image_steps"
+              type="number"
+              min={1}
+              max={8}
+              defaultValue={s?.cloudflare_image_steps || 4}
+            />
+          </label>
+          <label>
+            Seed mode
+            <select
+              name="image_seed_mode"
+              defaultValue={s?.image_seed_mode || "random"}
+            >
+              <option value="random">Random</option>
+              <option value="fixed">Fixed</option>
+            </select>
+          </label>
+          <label>
+            Fixed seed
+            <input
+              name="image_fixed_seed"
+              type="number"
+              min={1}
+              max={2147483647}
+              defaultValue={s?.image_fixed_seed || 1}
+            />
+          </label>
+          <label>
+            Max images per short
+            <input
+              name="max_images_per_short"
+              type="number"
+              min={1}
+              max={5}
+              defaultValue={s?.max_images_per_short || 5}
+            />
+          </label>
+        </div>
+      </fieldset>
       <div className="form-grid">
         <label>
           Primary language

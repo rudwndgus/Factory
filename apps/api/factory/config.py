@@ -34,6 +34,15 @@ STAGES = [
 DEFAULTS = dict(
     visual_source_mode="AI First",
     visual_style_preset="cinematic, mysterious, educational, high-contrast, clean, visually striking",
+    image_provider=os.getenv("IMAGE_PROVIDER", "cloudflare"),
+    image_fallback_provider=os.getenv("IMAGE_FALLBACK_PROVIDER", "openai"),
+    cloudflare_image_model=os.getenv(
+        "CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell"
+    ),
+    cloudflare_image_steps=int(os.getenv("CLOUDFLARE_IMAGE_STEPS", "4")),
+    image_seed_mode="random",
+    image_fixed_seed=1,
+    max_images_per_short=5,
     direction="Discover something surprising in under one minute.",
     language="English",
     audience="Global curious viewers",

@@ -41,6 +41,19 @@ TEST_SCRIPT = {
 }
 
 
+def visual_scene_groups(sentences, max_images=5):
+    """Keep narration intact while grouping it into a bounded number of visuals."""
+    if not sentences:
+        return []
+    count = min(max(1, int(max_images)), 5, len(sentences))
+    groups = []
+    for index in range(count):
+        start = index * len(sentences) // count
+        end = (index + 1) * len(sentences) // count
+        groups.append((start, end, " ".join(sentences[start:end])))
+    return groups
+
+
 def enqueue(office_id, test_mode=False, topic_id=None, ai_visuals=False):
     office = db.office(office_id)
     if not office:
@@ -230,25 +243,44 @@ def run_stage(job):
         for claim in script.get("claims", []):
             db.put("research_claims", office_id, claim, id)
     elif stage == 3:
+        sentence_groups = visual_scene_groups(
+            video["script"]["sentences"], settings.get("max_images_per_short", 5)
+        )
         scenes = [
             dict(
                 scene_number=i + 1,
-                narration=s,
-                subtitle=s,
+                narration=narration,
+                subtitle=narration,
                 visual_type="SCENE_STILL",
                 visual_query=video["title"],
                 motion_type="zoom",
                 transition="cut",
                 duration_target=settings["duration"]
-                / len(video["script"]["sentences"]),
+                / len(sentence_groups),
                 status="planned",
+                narration_sentence_range=[start + 1, end],
             )
-            for i, s in enumerate(video["script"]["sentences"])
+            for i, (start, end, narration) in enumerate(sentence_groups)
         ]
         visuals = video["script"].get("visuals", [])
-        for i, scene in enumerate(scenes):
+        for i, (scene, (start, end, _)) in enumerate(zip(scenes, sentence_groups)):
+            visual_index = i if len(visuals) == len(sentence_groups) else start
+            proposed = visuals[visual_index] if visual_index < len(visuals) else None
+            if (
+                isinstance(proposed, dict)
+                and len(visuals) != len(sentence_groups)
+                and end - start > 1
+            ):
+                proposed = proposed | {
+                    "prompt": ". ".join(
+                        str(v.get("prompt", ""))
+                        for v in visuals[start:end]
+                        if isinstance(v, dict) and v.get("prompt")
+                    )
+                    or proposed.get("prompt", "")
+                }
             scene.update(assets.visual_plan(scene["narration"], video["title"], settings, i,
-                         visuals[i] if i < len(visuals) else None, space_test=test))
+                         proposed, space_test=test))
         video["scenes"] = scenes
         for i, s in enumerate(scenes):
             db.put("video_scenes", office_id, s, id, id=f"{id}-{i}")

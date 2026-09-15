@@ -1,5 +1,7 @@
 import json
 import time
+import base64
+import io
 import pytest
 import httpx
 import logging
@@ -29,7 +31,7 @@ def test_visual_modes_and_provenance(monkeypatch, tmp_path):
     assert settings["visual_source_mode"] == "AI First"
     scene = {"narration": "Space is silent"} | assets.visual_plan("Space is silent", "Space", settings, 0, space_test=True)
     calls = []
-    monkeypatch.setattr(assets.OpenAI, "image", lambda self, prompt, path: calls.append("ai") or {"model": "mock"})
+    monkeypatch.setattr(assets, "generate_image", lambda *args: calls.append("ai") or {"model": "mock", "provider": "mock-ai"})
     monkeypatch.setattr(assets, "acquire", lambda *a, **kw: calls.append("real") or {"provider": "mock-real"})
     asset = assets.acquire_scene(scene, tmp_path / "a.png", 0, settings, first(), "v")
     assert calls == ["ai"] and asset["asset_source"] == "ai"
@@ -46,7 +48,7 @@ def test_documentary_never_fabricated(monkeypatch, tmp_path):
     settings = db.office(first())["settings"]
     scene = {"narration": "Official photo"} | assets.visual_plan("Official photo", "NASA", settings, 0, {"requires_real": True})
     monkeypatch.setattr(assets, "acquire", lambda *a, **kw: None)
-    monkeypatch.setattr(assets.OpenAI, "image", lambda *a: pytest.fail("Must not fabricate documentary image"))
+    monkeypatch.setattr(assets, "generate_image", lambda *a: pytest.fail("Must not fabricate documentary image"))
     with pytest.raises(ConfigurationRequired, match="authentic"):
         assets.acquire_scene(scene, tmp_path / "a.png", 0, settings, first(), "v")
 
@@ -58,10 +60,114 @@ def test_ai_failure_has_no_placeholder_fallback(monkeypatch, tmp_path):
     scene = {"narration": "Space"} | assets.visual_plan("Space", "Space", settings, 0)
     def fail(*args):
         raise ConfigurationRequired("Image model access denied")
-    monkeypatch.setattr(assets.OpenAI, "image", fail)
+    monkeypatch.setattr(assets, "generate_image", fail)
     monkeypatch.setattr(assets, "acquire", lambda *a, **kw: pytest.fail("No fallback"))
     with pytest.raises(ConfigurationRequired):
         assets.acquire_scene(scene, tmp_path / "a.png", 0, settings, first(), "v")
+
+
+def test_cloudflare_flux_provider_decodes_image_and_limits_steps(monkeypatch, tmp_path):
+    from PIL import Image
+    from factory import providers
+
+    encoded_file = io.BytesIO()
+    Image.new("RGB", (16, 24), "navy").save(encoded_file, format="JPEG")
+    encoded = base64.b64encode(encoded_file.getvalue()).decode()
+    requested = {}
+    monkeypatch.setattr(providers, "secret", lambda name: {
+        "CLOUDFLARE_ACCOUNT_ID": "account-test",
+        "CLOUDFLARE_API_TOKEN": "token-test",
+    }.get(name, ""))
+    monkeypatch.setattr(providers, "allowed_call", lambda *args: None)
+    monkeypatch.setattr(providers, "reserve", lambda *args, **kwargs: None)
+    def post(url, **kwargs):
+        requested.update(url=url, **kwargs)
+        return httpx.Response(200, json={"success": True, "result": {"image": encoded}})
+    monkeypatch.setattr(providers.httpx, "post", post)
+    output = tmp_path / "image.png"
+    result = providers.CloudflareWorkersAIImageProvider(
+        first(), "video", {"cloudflare_image_steps": 4, "image_seed_mode": "fixed", "image_fixed_seed": 42}
+    ).image("cinematic Saturn", output)
+    assert output.is_file() and Image.open(output).format == "PNG"
+    assert requested["json"] == {"prompt": "cinematic Saturn", "seed": 42, "steps": 4}
+    assert requested["headers"]["Authorization"] == "Bearer token-test"
+    assert result["model"] == "@cf/black-forest-labs/flux-1-schnell"
+
+
+def test_cloudflare_quota_error_is_clear_and_sanitized(monkeypatch, tmp_path):
+    from factory import providers
+
+    monkeypatch.setattr(providers, "secret", lambda name: "token-secret" if name.endswith("TOKEN") else "account-secret")
+    monkeypatch.setattr(providers, "allowed_call", lambda *args: None)
+    monkeypatch.setattr(providers, "reserve", lambda *args, **kwargs: None)
+    monkeypatch.setattr(providers.httpx, "post", lambda *args, **kwargs: httpx.Response(
+        429, json={"errors": [{"message": "quota exhausted token-secret"}]}
+    ))
+    with pytest.raises(providers.ImageProviderFailure, match="quota/free allocation") as error:
+        providers.CloudflareWorkersAIImageProvider(first(), "video").image("space", tmp_path / "x.png")
+    assert "token-secret" not in str(error.value)
+
+
+def test_image_provider_fallback_is_explicit(monkeypatch, tmp_path):
+    from factory import providers
+
+    calls = []
+    class FakeProvider:
+        def __init__(self, name):
+            self.name = name
+        def image(self, prompt, output):
+            calls.append(self.name)
+            if self.name == "cloudflare":
+                raise providers.ImageProviderFailure("quota exhausted")
+            return {"provider": "OpenAI Images", "model": "mock"}
+    monkeypatch.setattr(
+        providers,
+        "image_provider",
+        lambda name, *args: FakeProvider(name),
+    )
+    settings = {"image_provider": "cloudflare", "image_fallback_provider": "openai"}
+    result = providers.generate_image("space", tmp_path / "x.png", first(), "v", settings)
+    assert calls == ["cloudflare", "openai"] and result["fallback_from"] == "cloudflare"
+    calls.clear()
+    with pytest.raises(providers.ImageProviderFailure):
+        providers.generate_image(
+            "space", tmp_path / "x.png", first(), "v", settings, allow_fallback=False
+        )
+    assert calls == ["cloudflare"]
+
+
+def test_storyboard_groups_long_narration_to_five_visuals():
+    sentences = [f"sentence {index}" for index in range(8)]
+    groups = engine.visual_scene_groups(sentences, 5)
+    assert len(groups) == 5
+    assert " ".join(group[2] for group in groups) == " ".join(sentences)
+
+
+def test_curiosity_ai_run_records_five_cloudflare_assets(monkeypatch, tmp_path):
+    from factory import assets
+
+    monkeypatch.setattr(engine, "MEDIA", tmp_path)
+    calls = []
+    def generate(prompt, output, office_id, video_id, settings, allow_fallback=True):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"mock-flux-image")
+        calls.append(prompt)
+        return {
+            "provider": "Cloudflare Workers AI",
+            "provider_id": "cloudflare",
+            "model": "@cf/black-forest-labs/flux-1-schnell",
+            "steps": 4,
+            "seed": len(calls),
+        }
+    monkeypatch.setattr(assets, "generate_image", generate)
+    engine.set_mode(first(), "RUNNING")
+    video_id = engine.enqueue(first(), True, ai_visuals=True)
+    for _ in range(5):
+        engine.tick()
+    video = next(row["data"] for row in db.rows("videos", first()) if row["id"] == video_id)
+    assets_rows = db.rows("video_assets", first(), video_id)
+    assert len(video["scenes"]) == 5 and len(calls) == 5 and len(assets_rows) == 5
+    assert all(row["data"]["provider"] == "Cloudflare Workers AI" for row in assets_rows)
 
 
 def test_stop_cancels_running_and_employee_reports():
@@ -85,7 +191,11 @@ def test_visual_settings_survive_migration():
         settings = db.office(first())["settings"] | {"visual_source_mode": "Real First"}
         c.execute("UPDATE office_settings SET payload=? WHERE office_id=?", (json.dumps(settings), first()))
     db.migrate()
-    assert db.office(first())["settings"]["visual_source_mode"] == "Real First"
+    migrated = db.office(first())["settings"]
+    assert migrated["visual_source_mode"] == "Real First"
+    assert migrated["image_provider"] == "cloudflare"
+    assert migrated["cloudflare_image_steps"] == 4
+    assert migrated["max_images_per_short"] == 5
 
 
 def test_single_scene_regeneration_preserves_other_images(monkeypatch, tmp_path):
@@ -325,6 +435,42 @@ def client():
     ).json()["token"]
     c.headers["Authorization"] = "Bearer " + token
     return c
+
+
+def test_image_provider_endpoint_returns_protected_preview(monkeypatch, tmp_path):
+    from factory import providers, main as main_module
+
+    monkeypatch.setattr(main_module, "MEDIA", tmp_path)
+
+    def generate(prompt, output, office_id, video_id, settings, allow_fallback=True):
+        assert allow_fallback is False
+        output.write_bytes(b"sample-image")
+        return {"provider": "Cloudflare Workers AI", "model": "flux-test", "steps": 4, "seed": 7}
+
+    monkeypatch.setattr(providers, "generate_image", generate)
+    response = client().post(
+        "/api/system/test-image-provider",
+        json={"office_id": first(), "prompt": "cinematic space"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["success"] is True and result["provider"] == "Cloudflare Workers AI"
+    preview = client().get(result["preview_url"])
+    assert preview.status_code == 200 and preview.content == b"sample-image"
+
+
+def test_image_provider_endpoint_exposes_safe_configuration_error(monkeypatch):
+    from factory import providers
+
+    def fail(*args, **kwargs):
+        raise providers.ImageProviderFailure("Configure Cloudflare credentials")
+
+    monkeypatch.setattr(providers, "generate_image", fail)
+    response = client().post(
+        "/api/system/test-image-provider", json={"office_id": first()}
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Configure Cloudflare credentials"}
 
 
 def test_qc_and_test_publication_blocked(monkeypatch):

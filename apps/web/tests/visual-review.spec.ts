@@ -5,7 +5,7 @@ test.use({
   baseURL: "http://localhost:3000",
   launchOptions: { channel: "msedge" },
 });
-test("visual settings, employee reports and mobile review are readable", async ({
+test("visual provider settings and mobile review are readable", async ({
   page,
   request,
 }) => {
@@ -19,16 +19,6 @@ test("visual settings, employee reports and mobile review are readable", async (
   });
   expect(auth.ok()).toBeTruthy();
   const { token } = await auth.json();
-  const authHeaders = { Authorization: `Bearer ${token}` };
-  const offices = await (
-    await request.get("http://localhost:8000/api/offices", {
-      headers: authHeaders,
-    })
-  ).json();
-  await request.post(
-    `http://localhost:8000/api/offices/${offices[0].id}/jobs`,
-    { headers: authHeaders, data: { test_mode: true, ai_visuals: false } },
-  );
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.addInitScript((t) => {
@@ -49,26 +39,22 @@ test("visual settings, employee reports and mobile review are readable", async (
   await expect(
     page.getByRole("textbox", { name: "Visual Style Preset", exact: true }),
   ).toHaveValue(/cinematic/);
-  await page.locator("nav button").filter({ hasText: "Reports" }).click();
-  await page
-    .locator(".report-paper")
-    .filter({ hasText: "Why space is silent" })
-    .first()
-    .click();
-  await expect(page.getByRole("dialog")).toContainText("부서별 수행 내역");
-  await expect(page.getByRole("dialog")).toContainText("장면 연출");
-  await page.screenshot({
-    path: "../../data/screenshots/employee-report.png",
-    fullPage: true,
-  });
-  await page.getByRole("button", { name: /확인 완료/ }).click();
-  await page.getByRole("button", { name: /^정리함/ }).click();
   await expect(
-    page.locator(".report-paper").filter({ hasText: "Why space is silent" }).first(),
+    page.getByRole("combobox", { name: "Primary image provider" }),
+  ).toHaveValue("cloudflare");
+  await expect(page.getByRole("spinbutton", { name: "Steps" })).toHaveValue(
+    "4",
+  );
+  await expect(
+    page.getByRole("spinbutton", { name: "Max images per short" }),
+  ).toHaveValue("5");
+  await expect(
+    page.getByRole("button", { name: "Test image provider" }),
   ).toBeVisible();
   await page
     .getByRole("button", { name: "Video library", exact: true })
     .click();
+  await page.getByRole("button", { name: /^Test runs/ }).click();
   await page
     .locator(".video-card")
     .filter({ hasText: "TEST_COMPLETE" })

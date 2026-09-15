@@ -1790,6 +1790,33 @@ details pre {
 .muted {
   color: #8b9182;
 }
+.provider-test {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-top: 1px solid #e0e4d8;
+}
+.provider-test > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+.provider-test-result img {
+  width: min(220px, 100%);
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid #dbe2d4;
+}
+.office-form fieldset {
+  margin: 8px 0 18px;
+  padding: 16px;
+  border: 1px solid #dbe2d4;
+  border-radius: 10px;
+}
+.office-form legend {
+  padding: 0 8px;
+  font-weight: 700;
+}
 @media (max-width: 680px) {
   .report-summary {
     grid-template-columns: 1fr;

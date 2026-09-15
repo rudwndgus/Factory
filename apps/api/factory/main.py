@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, model_validator
 from . import database as db, engine, reports, youtube
 from .config import MEDIA, DEFAULTS
 from .security import require_owner, login, save_secret, secret, digest
+from .providers import ConfigurationRequired
 from fastapi import UploadFile, File
 
 scheduler = BackgroundScheduler()
@@ -62,6 +63,13 @@ async def value_error(request, exc):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
+@app.exception_handler(ConfigurationRequired)
+async def provider_configuration_error(request, exc):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
 class Login(BaseModel):
     password: str = Field(max_length=1024)
 
@@ -101,6 +109,20 @@ class OfficeInput(BaseModel):
             raise ValueError("Invalid visual source mode")
         if not isinstance(s["visual_style_preset"], str) or not 1 <= len(s["visual_style_preset"]) <= 500:
             raise ValueError("Visual style must be 1–500 characters")
+        if s["image_provider"] not in ("cloudflare", "openai"):
+            raise ValueError("Invalid primary image provider")
+        if s["image_fallback_provider"] not in ("none", "cloudflare", "openai"):
+            raise ValueError("Invalid fallback image provider")
+        if not isinstance(s["cloudflare_image_model"], str) or not 1 <= len(s["cloudflare_image_model"]) <= 200:
+            raise ValueError("Cloudflare image model is invalid")
+        if not 1 <= int(s["cloudflare_image_steps"]) <= 8:
+            raise ValueError("Cloudflare image steps must be 1–8")
+        if s["image_seed_mode"] not in ("random", "fixed"):
+            raise ValueError("Invalid image seed mode")
+        if not 1 <= int(s["image_fixed_seed"]) <= 2_147_483_647:
+            raise ValueError("Fixed image seed is invalid")
+        if not 1 <= int(s["max_images_per_short"]) <= 5:
+            raise ValueError("Max images per short must be 1–5")
         return self
 
 
@@ -111,7 +133,8 @@ class ModeInput(BaseModel):
 
 class SecretInput(BaseModel):
     name: Literal[
-        "OPENAI_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "PEXELS_API_KEY"
+        "OPENAI_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "PEXELS_API_KEY",
+        "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"
     ]
     value: str = Field(min_length=1, max_length=4096)
 
@@ -145,6 +168,15 @@ class RegenerateInput(BaseModel):
     stage: Literal[2, 3, 4, 5, 7]
     scene: int | None = None
     sentences: list[str] | None = Field(default=None, min_length=3, max_length=12)
+
+
+class ImageProviderTestInput(BaseModel):
+    office_id: str
+    prompt: str = Field(
+        default="A cinematic mysterious view of Saturn above a dark icy moon, vertical educational short, no text",
+        min_length=3,
+        max_length=2048,
+    )
 
 
 def exists(id):
@@ -503,6 +535,8 @@ def integrations():
     result = []
     for name in [
         "OPENAI_API_KEY",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_API_TOKEN",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "PEXELS_API_KEY",
@@ -524,6 +558,47 @@ def integrations():
             )
         )
     return result
+
+
+@app.post("/api/system/test-image-provider", dependencies=[Depends(require_owner)])
+def test_image_provider(body: ImageProviderTestInput):
+    from .providers import generate_image
+
+    office = exists(body.office_id)
+    directory = (MEDIA / body.office_id / "system").resolve()
+    if not directory.is_relative_to(MEDIA.resolve()):
+        raise ValueError("Invalid provider test path")
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / "image-provider-test.png"
+    result = generate_image(
+        body.prompt,
+        output,
+        body.office_id,
+        "image-provider-test",
+        office["settings"],
+        allow_fallback=False,
+    )
+    return {
+        "success": True,
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "steps": result.get("steps"),
+        "seed": result.get("seed"),
+        "fallback_from": result.get("fallback_from"),
+        "preview_url": f"/api/system/test-image-provider/preview?office_id={body.office_id}",
+    }
+
+
+@app.get(
+    "/api/system/test-image-provider/preview",
+    dependencies=[Depends(require_owner)],
+)
+def image_provider_preview(office_id: str):
+    exists(office_id)
+    path = (MEDIA / office_id / "system" / "image-provider-test.png").resolve()
+    if not path.is_relative_to(MEDIA.resolve()) or not path.is_file():
+        raise HTTPException(404, "Provider test image not available")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.put("/api/integrations", dependencies=[Depends(require_owner)])

@@ -49,8 +49,8 @@ def migrate():
         db.execute("INSERT OR IGNORE INTO migrations VALUES(1,?)", (time.time(),))
         for row in db.execute("SELECT office_id,payload FROM office_settings").fetchall():
             settings = json.loads(row["payload"])
-            for key in ("visual_source_mode", "visual_style_preset"):
-                settings.setdefault(key, DEFAULTS[key])
+            for key, value in DEFAULTS.items():
+                settings.setdefault(key, value)
             db.execute("UPDATE office_settings SET payload=? WHERE office_id=?",
                        (json.dumps(settings), row["office_id"]))
         db.execute("INSERT OR IGNORE INTO migrations VALUES(2,?)", (time.time(),))
