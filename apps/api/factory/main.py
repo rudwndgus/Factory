@@ -357,10 +357,11 @@ def inspect(id: str):
     return {"id": reports.inspect(id)}
 
 
-@app.post("/api/offices/{id}/reports/{kind}", dependencies=[Depends(require_owner)])
-def make_report(id: str, kind: Literal["daily", "weekly"]):
+@app.post("/api/offices/{id}/reports/{report_id}/archive", dependencies=[Depends(require_owner)])
+def archive_report(id: str, report_id: str):
     exists(id)
-    return {"id": reports.report(id, kind)}
+    reports.archive(id, report_id)
+    return {"ok": True}
 
 
 @app.post("/api/offices/{id}/analytics/refresh", dependencies=[Depends(require_owner)])
@@ -480,6 +481,7 @@ def publish(id: str, video_id: str, body: PublishInput):
     v["status"] = "PUBLISHED"
     v["youtube_id"] = result["youtube_id"]
     db.put("videos", id, v, video_id, video_id)
+    reports.mark_uploaded(id, video_id, result.get("uploaded_at"))
     return result
 
 

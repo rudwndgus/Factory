@@ -1716,10 +1716,82 @@ details pre {
   }
 }
 /* Authenticated scene review and human-readable employee reports. */
-.scene-review-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 16px; margin: 20px 0; }
-.scene-review-card { border: 1px solid #dbe2d4; border-radius: 12px; overflow: hidden; background: #f8faf4; }
-.scene-review-card img { width: 100%; aspect-ratio: 9/16; object-fit: cover; display: block; }
-.scene-review-card > div { padding: 12px; }
-.scene-review-card p, .readable-report li { overflow-wrap: anywhere; line-height: 1.7; }
-.readable-report h3 { margin-top: 24px; }
-.readable-report li { margin-bottom: 12px; }
+.scene-review-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+}
+.scene-review-card {
+  border: 1px solid #dbe2d4;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #f8faf4;
+}
+.scene-review-card img {
+  width: 100%;
+  aspect-ratio: 9/16;
+  object-fit: cover;
+  display: block;
+}
+.scene-review-card > div {
+  padding: 12px;
+}
+.scene-review-card p,
+.readable-report li {
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+}
+.readable-report h3 {
+  margin-top: 24px;
+}
+.readable-report li {
+  margin-bottom: 12px;
+}
+.report-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin: 18px 0;
+}
+.report-summary > div,
+.department-reports > section {
+  border: 1px solid #dbe2d4;
+  border-radius: 10px;
+  padding: 14px;
+  background: #f8faf4;
+}
+.report-summary dt {
+  color: #7c866d;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.report-summary dd {
+  margin: 5px 0 0;
+  font-weight: 600;
+}
+.department-reports {
+  display: grid;
+  gap: 12px;
+}
+.department-reports header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.department-activity h4 {
+  margin: 14px 0 4px;
+}
+.department-alert,
+.noteworthy {
+  color: #9a4c36;
+}
+.muted {
+  color: #8b9182;
+}
+@media (max-width: 680px) {
+  .report-summary {
+    grid-template-columns: 1fr;
+  }
+}

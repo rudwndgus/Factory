@@ -46,7 +46,7 @@ def enqueue(office_id, test_mode=False, topic_id=None, ai_visuals=False):
     if not office:
         raise ValueError("Office not found")
     if office["mode"] == "EMERGENCY_STOP" or (
-        not test_mode and office["mode"] != "RUNNING"
+        (not test_mode or ai_visuals) and office["mode"] != "RUNNING"
     ):
         raise ValueError("Start the Office before queuing production")
     id = db.uid()
@@ -430,8 +430,8 @@ def tick():
                 job["id"],
             )
             db.event(job["office_id"], message, "error", job["id"])
-            from .reports import employee_report
-            employee_report(job["office_id"], job["id"], role, "작업 대기/중단", "제작 작업", message)
+            from .reports import add_exception
+            add_exception(job["office_id"], job["id"], role, message)
         finally:
             with db.connection() as c:
                 c.execute(
@@ -507,6 +507,8 @@ def publish_approved():
                 v["status"] = "PUBLISHED"
                 v["youtube_id"] = result["youtube_id"]
                 db.put("videos", office["id"], v, v["id"], v["id"])
+                from .reports import mark_uploaded
+                mark_uploaded(office["id"], v["id"], result.get("uploaded_at"))
                 db.event(office["id"], "Approved video uploaded", video_id=v["id"])
             except Exception:
                 v["status"] = "UPLOAD_BLOCKED"

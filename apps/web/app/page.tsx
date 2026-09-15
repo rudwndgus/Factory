@@ -125,7 +125,8 @@ export default function Page() {
     [integrations, setIntegrations] = useState<any[]>([]),
     [detail, setDetail] = useState<any>(null),
     [playback, setPlayback] = useState(""),
-    [hq, setHq] = useState(false);
+    [hq, setHq] = useState(false),
+    [reportShelf, setReportShelf] = useState<"inbox" | "archive">("inbox");
   const [server, setServer] = useState("http://localhost:8000"),
     [password, setPassword] = useState("");
   const controller = useRef<AbortController | null>(null);
@@ -135,6 +136,14 @@ export default function Page() {
   const videos = snap?.videos || emptyRows,
     jobs = snap?.jobs || [],
     reports = snap?.reports || emptyRows;
+  const productionReports = reports.filter((r) => r.data.kind === "production");
+  const inboxReports = productionReports.filter((r) => !r.data.archived);
+  const archivedReports = productionReports.filter((r) => r.data.archived);
+  const visibleReports =
+    reportShelf === "inbox" ? inboxReports : archivedReports;
+  const teamWorking =
+    mode === "RUNNING" &&
+    jobs.some((j) => ["QUEUED", "RUNNING", "RETRYING"].includes(j.status));
   const today = new Date().toISOString().slice(0, 10);
   const costs = snap?.cost_events || [];
   const dailyCost = costs
@@ -151,12 +160,16 @@ export default function Page() {
       setConnected(true);
     }
   }
-  async function act(fn: () => Promise<any>, message = "Saved") {
+  async function act(
+    fn: () => Promise<any>,
+    message = "Saved",
+    refreshAfter = true,
+  ) {
     setBusy(true);
     setError("");
     try {
       await fn();
-      if (id) await refresh();
+      if (id && refreshAfter) await refresh();
       setNotice(message);
     } catch (e) {
       setError((e as Error).message);
@@ -186,7 +199,9 @@ export default function Page() {
   }, []);
   useEffect(() => {
     if (connected && tab === "Settings") {
-      api("/api/integrations").then(setIntegrations).catch(() => {});
+      api("/api/integrations")
+        .then(setIntegrations)
+        .catch(() => {});
     }
   }, [connected, tab]);
   useEffect(() => {
@@ -345,8 +360,8 @@ export default function Page() {
               >
                 <Icon size={18} />
                 {t}
-                {t === "Reports" && reports.length > 0 ? (
-                  <b>{reports.length}</b>
+                {t === "Reports" && inboxReports.length > 0 ? (
+                  <b>{inboxReports.length}</b>
                 ) : t === "Office" ? (
                   <span className="nav-dot" />
                 ) : null}
@@ -467,16 +482,22 @@ export default function Page() {
             </div>
             <button
               className="btn primary"
-              disabled={busy}
+              disabled={busy || (connected && mode !== "RUNNING")}
+              title={connected && mode !== "RUNNING" ? "먼저 Office에서 Start를 눌러주세요." : undefined}
               onClick={() => {
                 if (need())
-                  void act(
-                    () => {
-                      if (!window.confirm("AI 이미지 5장을 생성하는 테스트입니다. API 비용이 발생하며 업로드는 하지 않습니다. 진행할까요?")) return Promise.resolve();
-                      return api(root + "/jobs", "POST", { test_mode: true, ai_visuals: true });
-                    },
-                    "TEST RUN queued. No YouTube publication.",
-                  );
+                  void act(() => {
+                    if (
+                      !window.confirm(
+                        "AI 이미지 5장을 생성하는 테스트입니다. API 비용이 발생하며 업로드는 하지 않습니다. 진행할까요?",
+                      )
+                    )
+                      return Promise.resolve();
+                    return api(root + "/jobs", "POST", {
+                      test_mode: true,
+                      ai_visuals: true,
+                    });
+                  }, "TEST RUN queued. No YouTube publication.");
               }}
             >
               <FlaskConical size={16} /> AI Test run <ArrowUpRight size={14} />
@@ -628,9 +649,10 @@ export default function Page() {
                 <div className="map-wrap">
                   <OfficeScene
                     employees={snap?.employees || []}
-                    reports={reports.length}
+                    reports={inboxReports.length}
                     connected={connected}
                     mode={office?.mode}
+                    teamWorking={teamWorking}
                     onSelect={openEmployee}
                     blocked={!!modal}
                   />
@@ -738,8 +760,8 @@ export default function Page() {
                     <div>
                       <span className="eyebrow">CEO INBOX</span>
                       <h3>
-                        {reports.length
-                          ? `${reports.length} reports to explore`
+                        {inboxReports.length
+                          ? `${inboxReports.length} reports waiting for confirmation`
                           : "Nothing to review. Yet."}
                       </h3>
                       <p>
@@ -965,29 +987,29 @@ export default function Page() {
           ) : tab === "Reports" ? (
             <section className="panel list-panel">
               <div className="section-head">
-                <h2>CEO report archive</h2>
+                <h2>영상 제작 보고서</h2>
                 <div className="toolbar">
-                  {["daily", "weekly"].map((k) => (
-                    <button
-                      className="btn"
-                      disabled={busy}
-                      key={k}
-                      onClick={() => {
-                        if (need())
-                          void act(
-                            () => api(root + "/reports/" + k, "POST"),
-                            "Report generated",
-                          );
-                      }}
-                    >
-                      Generate {k}
-                    </button>
-                  ))}
+                  <button
+                    className={
+                      "btn " + (reportShelf === "inbox" ? "primary" : "")
+                    }
+                    onClick={() => setReportShelf("inbox")}
+                  >
+                    확인 대기 {inboxReports.length}
+                  </button>
+                  <button
+                    className={
+                      "btn " + (reportShelf === "archive" ? "primary" : "")
+                    }
+                    onClick={() => setReportShelf("archive")}
+                  >
+                    정리함 {archivedReports.length}
+                  </button>
                 </div>
               </div>
-              {reports.length ? (
+              {visibleReports.length ? (
                 <div className="report-grid">
-                  {reports.map((r) => (
+                  {visibleReports.map((r) => (
                     <button
                       className="report-paper"
                       key={r.id}
@@ -998,9 +1020,13 @@ export default function Page() {
                     >
                       <span className="eyebrow">PIXEL SHORTS FACTORY</span>
                       <FileText size={30} />
-                      <h3>{r.data.title || `${r.data.kind.toUpperCase()} REPORT`}</h3>
+                      <h3>
+                        {r.data.title || `${r.data.kind.toUpperCase()} REPORT`}
+                      </h3>
                       <p>{r.data.topic || r.data.summary}</p>
-                      <p>{new Date(r.created * 1000).toLocaleDateString()}</p>
+                      <p>
+                        {r.data.upload_date || "업로드 대기"} · {r.data.status}
+                      </p>
                       <div />
                       <div />
                       <div />
@@ -1012,8 +1038,12 @@ export default function Page() {
                 </div>
               ) : (
                 <Empty
-                  title="Your desk is ready."
-                  text="Run an inspection or generate a daily report. Reports use only your stored production history."
+                  title={
+                    reportShelf === "archive"
+                      ? "정리함이 비어 있습니다."
+                      : "확인할 영상 보고서가 없습니다."
+                  }
+                  text="영상 한 편마다 10개 부서의 작업과 특이사항이 한 장에 정리됩니다."
                 />
               )}
             </section>
@@ -1329,10 +1359,11 @@ export default function Page() {
                   onSave={(body) =>
                     act(async () => {
                       const o = await api("/api/offices", "POST", body);
-                      await boot();
+                      setOffices(await api("/api/offices"));
                       setId(o.id);
+                      setSnap(await api(`/api/offices/${o.id}/snapshot`));
                       setModal(null);
-                    }, "Office created")
+                    }, "Office created", false)
                   }
                 />
               </>
@@ -1434,7 +1465,26 @@ export default function Page() {
             ) : modal === "report" ? (
               <>
                 <span className="eyebrow">DELIVERED TO THE CEO DESK</span>
-                <ReadableReport report={reports.find((r) => r.id === selected)?.data} />
+                <ReadableReport
+                  report={reports.find((r) => r.id === selected)?.data}
+                />
+                {!reports.find((r) => r.id === selected)?.data.archived && (
+                  <button
+                    className="btn primary full"
+                    onClick={() =>
+                      void act(async () => {
+                        await api(
+                          root + `/reports/${selected}/archive`,
+                          "POST",
+                        );
+                        setModal(null);
+                        setReportShelf("archive");
+                      }, "보고서를 확인하고 정리함으로 옮겼습니다.")
+                    }
+                  >
+                    <Check size={15} /> 확인 완료 · 정리함으로 이동
+                  </button>
+                )}
               </>
             ) : modal === "video" ? (
               <>
@@ -1478,9 +1528,20 @@ export default function Page() {
                         </button>
                       </div>
                     </div>
-                    <SceneReview scenes={detail.scenes || []} root={root + `/videos/${selected}`} regenerate={(scene) => {
-                      void act(async () => { await api(root + `/videos/${selected}/regenerate`, "POST", { stage: 4, scene }); setModal(null); }, "장면 재생성 접수 완료");
-                    }} />
+                    <SceneReview
+                      scenes={detail.scenes || []}
+                      root={root + `/videos/${selected}`}
+                      regenerate={(scene) => {
+                        void act(async () => {
+                          await api(
+                            root + `/videos/${selected}/regenerate`,
+                            "POST",
+                            { stage: 4, scene },
+                          );
+                          setModal(null);
+                        }, "장면 재생성 접수 완료");
+                      }}
+                    />
                     <details>
                       <summary>Sources, rights, and research</summary>
                       <pre>
@@ -1765,15 +1826,34 @@ function OfficeForm({
           required
         />
       </label>
-      <label>Visual Source Mode
-        <select name="visual_source_mode" defaultValue={s?.visual_source_mode || "AI First"}>
-          <option>AI First</option><option>Mixed</option><option>Real First</option>
+      <label>
+        Visual Source Mode
+        <select
+          name="visual_source_mode"
+          defaultValue={s?.visual_source_mode || "AI First"}
+        >
+          <option>AI First</option>
+          <option>Mixed</option>
+          <option>Real First</option>
         </select>
       </label>
-      <label>Visual Style Preset
-        <textarea name="visual_style_preset" required maxLength={500} rows={2} defaultValue={s?.visual_style_preset || "cinematic, mysterious, educational, high-contrast, clean, visually striking"} />
+      <label>
+        Visual Style Preset
+        <textarea
+          name="visual_style_preset"
+          required
+          maxLength={500}
+          rows={2}
+          defaultValue={
+            s?.visual_style_preset ||
+            "cinematic, mysterious, educational, high-contrast, clean, visually striking"
+          }
+        />
       </label>
-      <p>AI First는 장면별 AI 이미지를 우선 생성합니다. 실제 기록이 필요한 장면은 외부 자료를 사용하며, 생성 실패를 임의 도형으로 대체하지 않습니다.</p>
+      <p>
+        AI First는 장면별 AI 이미지를 우선 생성합니다. 실제 기록이 필요한 장면은
+        외부 자료를 사용하며, 생성 실패를 임의 도형으로 대체하지 않습니다.
+      </p>
       <div className="form-grid">
         <label>
           Primary language

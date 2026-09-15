@@ -65,8 +65,12 @@ def test_ai_failure_has_no_placeholder_fallback(monkeypatch, tmp_path):
 
 
 def test_stop_cancels_running_and_employee_reports():
+    engine.set_mode(first(), "RUNNING")
     id = engine.enqueue(first(), True, ai_visuals=True)
-    assert db.rows("reports", first(), id)[0]["data"]["role"] == "EDITOR"
+    report = db.rows("reports", first(), id)[0]["data"]
+    assert len(db.rows("reports", first(), id)) == 1
+    assert len(report["departments"]) == 10
+    assert next(s for s in report["departments"] if s["role"] == "EDITOR")["activities"]
     with db.connection() as c:
         c.execute("UPDATE jobs SET status='RUNNING' WHERE id=?", (id,))
         c.execute("UPDATE employee_states SET status='WORKING' WHERE office_id=?", (first(),))
@@ -87,6 +91,7 @@ def test_visual_settings_survive_migration():
 def test_single_scene_regeneration_preserves_other_images(monkeypatch, tmp_path):
     from factory import editing
     monkeypatch.setattr(editing, "MEDIA", tmp_path)
+    engine.set_mode(first(), "RUNNING")
     id = engine.enqueue(first(), True, ai_visuals=True)
     directory = tmp_path / first() / id
     directory.mkdir(parents=True)
@@ -104,6 +109,7 @@ def test_single_scene_regeneration_preserves_other_images(monkeypatch, tmp_path)
 def test_pause_between_images_keeps_checkpoint(monkeypatch, tmp_path):
     from factory import assets
     monkeypatch.setattr(engine, "MEDIA", tmp_path)
+    engine.set_mode(first(), "RUNNING")
     id = engine.enqueue(first(), True, ai_visuals=True)
     for _ in range(4):
         engine.tick()
@@ -286,12 +292,30 @@ def test_secret_roundtrip():
         )
 
 
-def test_report_has_no_fake_metrics():
-    reports.report(first())
-    r = db.rows("reports", first())[0]["data"]
-    assert r["produced"] == 0
-    assert r["analytics"] == {}
-    assert "Insufficient" in r["recommendation"]
+def test_one_report_per_video_and_archive():
+    id = engine.enqueue(first(), True)
+    reports.update_video_report(first(), id, "SCOUT", "소재 선정", "A topic", "done")
+    reports.update_video_report(first(), id, "RESEARCHER", "출처 조사", "A topic", "checked", ["source"])
+    rows = db.rows("reports", first(), id)
+    assert len(rows) == 1
+    r = rows[0]["data"]
+    assert r["title"] == "업로드 대기 · A topic"
+    assert len(r["departments"]) == 10
+    assert sum(bool(s["activities"]) for s in r["departments"]) == 3
+    reports.mark_uploaded(first(), id, 1_700_000_000)
+    r = db.rows("reports", first(), id)[0]["data"]
+    assert r["upload_date"] in r["title"] and "A topic" in r["title"]
+    reports.archive(first(), rows[0]["id"])
+    r = db.rows("reports", first(), id)[0]["data"]
+    assert r["archived"] is True and r["confirmed_at"]
+
+
+def test_report_exception_is_grouped_in_same_video_report():
+    id = engine.enqueue(first(), True)
+    reports.add_exception(first(), id, "ARTIST", "generation blocked")
+    rows = db.rows("reports", first(), id)
+    assert len(rows) == 1
+    assert rows[0]["data"]["noteworthy"] == ["generation blocked"]
 
 
 def client():
