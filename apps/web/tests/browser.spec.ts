@@ -73,6 +73,7 @@ test("authenticated office reads real state, creates office, persists settings a
   await page.getByRole("button", { name: "Office", exact: true }).click();
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(page.locator(".mode")).toContainText("RUNNING");
+  await expect(page.locator(".map-caption")).toContainText("공장 가동 중");
   await page.getByRole("button", { name: "Pause", exact: true }).click();
   await expect(page.locator(".mode")).toContainText("PAUSED");
   await page

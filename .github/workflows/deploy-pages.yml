@@ -37,6 +37,7 @@ jobs:
         working-directory: apps/web
         env:
           PAGES_BUILD: 'true'
+          NEXT_PUBLIC_API_URL: ${{ vars.PUBLIC_API_URL }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

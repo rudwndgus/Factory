@@ -15,8 +15,18 @@
 
 ### 휴대폰과 회사 PC 서버
 
-GitHub 웹앱은 모바일 화면을 지원하지만 휴대폰의 `localhost`는 회사 PC가 아닙니다. **회사 PC를 켜놓기만 해서는 외부 접속이 되지 않습니다.** 현재 서버는 `127.0.0.1:8000`으로 로컬에만 바인딩되어 있습니다.
-회사 IT의 허가를 받은 VPN/보안 원격 연결 또는 인증된 HTTPS 서버가 필요합니다. 회사 네트워크의 포트 개방/터널 설치는 별도 승인 후 진행하세요. PC 절전·재부팅·인터넷 단절 시 제작은 중단됩니다. API 키와 `.env`, `data`를 GitHub에 올리지 마세요.
+GitHub 웹앱은 모바일 화면을 지원합니다. 외부 기기에서도 실제 회사 PC의 API를 사용하려면 회사 PC에서 아래 명령으로 HTTPS 터널을 실행합니다.
+
+```powershell
+cd C:\Users\kjunghyun\Desktop\rud\Kyung\Factory
+powershell -ExecutionPolicy Bypass -File scripts/remote.ps1
+```
+
+스크립트는 API가 꺼져 있으면 먼저 실행하고, Cloudflare Quick Tunnel 주소를 만든 뒤 GitHub의 `PUBLIC_API_URL` 변수와 Pages 배포를 갱신합니다. 배포가 끝나면 휴대폰에서 웹앱을 열고 owner 비밀번호로 로그인하면 됩니다. PC 재시작 후에는 주소가 바뀌므로 위 명령을 다시 실행하고 약 2분 기다려야 합니다. 장기적으로 주소를 고정하려면 Cloudflare 계정과 소유 도메인으로 Named Tunnel을 구성해야 합니다.
+
+외부 접속을 끄려면 `powershell -ExecutionPolicy Bypass -File scripts/remote-stop.ps1`을 실행합니다.
+
+회사 PC가 켜져 있고 Windows 사용자가 로그인되어 있으며, 인터넷·API·터널 프로세스가 실행 중이어야 합니다. 회사 보안 정책상 터널 프로그램 사용 허가가 필요한지는 사용자 또는 IT 담당자가 확인해야 합니다. API 키와 `.env`, `data`를 GitHub에 올리지 마세요.
 
 작은 픽셀 사무실로 관리하는 실제 Shorts 제작 서버입니다. 각 사무실은 하나의 채널 작업공간이며, 직원의 상태는 SQLite에 저장된 제작 작업에서 갱신됩니다. Next.js 웹앱과 Python/FastAPI 제작 서버를 분리했습니다.
 

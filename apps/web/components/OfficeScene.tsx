@@ -27,6 +27,7 @@ export default function OfficeScene(props: Props) {
           light: import("phaser").GameObjects.Arc;
           label: import("phaser").GameObjects.Text;
           role: string;
+          phase: number;
           homeX: number;
           homeY: number;
         }[] = [];
@@ -207,6 +208,7 @@ export default function OfficeScene(props: Props) {
               light,
               label: text,
               role,
+              phase: i * 0.73,
               homeX: sprite.x,
               homeY: sprite.y,
             });
@@ -283,12 +285,26 @@ export default function OfficeScene(props: Props) {
                   ? 0xa4af91
                   : 0xadb7ac,
             );
-            p.sprite.setAngle(active ? Math.sin(t / 110) * 6 : 0);
+            p.sprite.setAngle(
+              active ? Math.sin(t / 105 + p.phase) * (assigned ? 10 : 7) : 0,
+            );
             p.sprite.setPosition(
-              p.homeX + (active ? Math.sin(t / 650) * 16 : 0),
-              p.homeY + (active ? Math.sin(t / 130) * 3 : 0),
+              p.homeX +
+                (active
+                  ? Math.sin(t / 420 + p.phase) * (assigned ? 25 : 18)
+                  : 0),
+              p.homeY +
+                (active
+                  ? Math.abs(Math.sin(t / 150 + p.phase)) * -7
+                  : 0),
             );
             p.light.setAlpha(active ? 0.65 + Math.sin(t / 180) * 0.35 : 1);
+            p.light.setScale(assigned ? 1.8 : active ? 1.25 : 1);
+            p.label.setText(
+              assigned && state?.stage
+                ? `${p.role.replace(" / ", "/")} · ${state.stage}`
+                : p.role.replace(" / ", "/"),
+            );
             p.label.setColor(
               assigned ? "#1f6b3d" : active ? "#537848" : "#60664f",
             );

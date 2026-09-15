@@ -141,9 +141,10 @@ export default function Page() {
   const archivedReports = productionReports.filter((r) => r.data.archived);
   const visibleReports =
     reportShelf === "inbox" ? inboxReports : archivedReports;
-  const teamWorking =
-    mode === "RUNNING" &&
-    jobs.some((j) => ["QUEUED", "RUNNING", "RETRYING"].includes(j.status));
+  const teamWorking = mode === "RUNNING";
+  const activeEmployees = (snap?.employees || []).filter(
+    (employee) => employee.status === "WORKING",
+  );
   const today = new Date().toISOString().slice(0, 10);
   const costs = snap?.cost_events || [];
   const dailyCost = costs
@@ -659,10 +660,21 @@ export default function Page() {
                   <div className="map-caption">
                     <span>
                       <span
-                        className={"connection-dot " + (connected ? "on" : "")}
+                        className={
+                          "connection-dot " + (teamWorking ? "on" : "")
+                        }
                       />
-                      {connected
-                        ? "Connected to your real production queue"
+                      {teamWorking
+                        ? activeEmployees.length
+                          ? `공장 가동 중 · 현재 담당 ${activeEmployees
+                              .map(
+                                (employee) =>
+                                  `${employee.role} (${employee.stage || "작업 중"})`,
+                              )
+                              .join(", ")}`
+                          : "공장 가동 중 · 직원 10명 대기 근무"
+                        : connected
+                          ? `공장 ${mode} · 직원 정지`
                         : "Connect a server to bring your office to life"}
                     </span>
                     <span>ORIGINAL PIXEL OFFICE</span>

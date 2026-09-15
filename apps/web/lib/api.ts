@@ -43,8 +43,19 @@ export const roles = [
   "ANALYST / UPLOADER",
 ];
 export function config() {
+  const deployedApi = process.env.NEXT_PUBLIC_API_URL || "";
+  const saved = localStorage.getItem("psf-api") || "";
+  const savedIsLocal = /^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(
+    saved,
+  );
+  const useDeployedApi =
+    location.protocol === "https:" &&
+    deployedApi.startsWith("https://") &&
+    (!saved || savedIsLocal);
   return {
-    url: localStorage.getItem("psf-api") || "http://localhost:8000",
+    url: useDeployedApi
+      ? deployedApi
+      : saved || deployedApi || "http://localhost:8000",
     token: sessionStorage.getItem("psf-token") || "",
   };
 }
