@@ -144,13 +144,28 @@ class CloudflareWorkersAIImageProvider:
             model=model,
         )
         url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+        payload = {"prompt": prompt, "seed": seed, "steps": steps}
         try:
             response = httpx.post(
                 url,
                 headers={"Authorization": f"Bearer {token}"},
-                json={"prompt": prompt, "seed": seed, "steps": steps},
+                json=payload,
                 timeout=timeout,
             )
+            seed_supported = True
+            if (
+                response.status_code == 400
+                and "properties '/seed'" in response.text
+                and "not allowed" in response.text
+            ):
+                payload.pop("seed")
+                response = httpx.post(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=payload,
+                    timeout=timeout,
+                )
+                seed_supported = False
         except httpx.HTTPError:
             raise ImageProviderFailure(
                 "Cloudflare Workers AI request was interrupted; retry the scene"
@@ -189,7 +204,9 @@ class CloudflareWorkersAIImageProvider:
             "provider_id": self.name,
             "model": model,
             "steps": steps,
-            "seed": seed,
+            "seed": seed if seed_supported else None,
+            "requested_seed": seed,
+            "seed_supported": seed_supported,
             "source_format": os.getenv("CLOUDFLARE_IMAGE_FORMAT", "jpg"),
         }
 

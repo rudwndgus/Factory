@@ -94,6 +94,30 @@ def test_cloudflare_flux_provider_decodes_image_and_limits_steps(monkeypatch, tm
     assert result["model"] == "@cf/black-forest-labs/flux-1-schnell"
 
 
+def test_cloudflare_retries_without_seed_for_rest_schema_compatibility(monkeypatch, tmp_path):
+    from PIL import Image
+    from factory import providers
+
+    encoded_file = io.BytesIO()
+    Image.new("RGB", (8, 8), "black").save(encoded_file, format="JPEG")
+    encoded = base64.b64encode(encoded_file.getvalue()).decode()
+    payloads = []
+    monkeypatch.setattr(providers, "secret", lambda name: "token" if name.endswith("TOKEN") else "account")
+    monkeypatch.setattr(providers, "allowed_call", lambda *args: None)
+    monkeypatch.setattr(providers, "reserve", lambda *args, **kwargs: None)
+    def post(*args, **kwargs):
+        payloads.append(dict(kwargs["json"]))
+        if len(payloads) == 1:
+            return httpx.Response(400, json={"errors": [{"message": "Additional or unevaluated properties '/seed' at '/' not allowed"}]})
+        return httpx.Response(200, json={"result": {"image": encoded}})
+    monkeypatch.setattr(providers.httpx, "post", post)
+    result = providers.CloudflareWorkersAIImageProvider(first(), "v").image(
+        "space", tmp_path / "image.png"
+    )
+    assert "seed" in payloads[0] and "seed" not in payloads[1]
+    assert result["seed_supported"] is False and result["seed"] is None
+
+
 def test_cloudflare_quota_error_is_clear_and_sanitized(monkeypatch, tmp_path):
     from factory import providers
 
