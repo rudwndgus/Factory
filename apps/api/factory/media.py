@@ -3,8 +3,10 @@ import math
 import os
 import shutil
 import subprocess
+import struct
 import textwrap
 import time
+import wave
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import imageio_ffmpeg
@@ -162,7 +164,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     (directory / "captions.ass").write_text(header + "\n".join(lines), encoding="utf-8")
 
 
-def render(directory, scenes, cancel=lambda: False):
+def _procedural_ambient_track(directory):
+    """Create a quiet original ambient bed locally; no third-party music rights."""
+    path = directory / "factory-ambient-bed.wav"
+    if path.exists():
+        return path
+    rate, seconds = 24000, 16
+    frequencies = (110.0, 164.81, 220.0)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(rate)
+        frames = bytearray()
+        for index in range(rate * seconds):
+            t = index / rate
+            fade = min(1.0, t / 2.0, (seconds - t) / 2.0)
+            pulse = 0.72 + 0.28 * math.sin(math.tau * t / 8.0)
+            sample = sum(
+                math.sin(math.tau * frequency * t + harmonic * 0.7)
+                for harmonic, frequency in enumerate(frequencies)
+            ) / len(frequencies)
+            frames.extend(struct.pack("<h", int(32767 * 0.13 * fade * pulse * sample)))
+        output.writeframes(frames)
+    return path
+
+
+def render(directory, scenes, cancel=lambda: False, settings=None):
     from .assets import local_track
     from .config import ROOT
 
@@ -211,13 +238,28 @@ def render(directory, scenes, cancel=lambda: False):
     (directory / "concat.txt").write_text(
         "\n".join(f"file '{p}'" for p in pieces), encoding="utf-8"
     )
+    settings = settings or {}
     music = local_track(ROOT / "media_library/music")
+    if (
+        not music
+        and settings.get("background_music_enabled", True)
+        and settings.get("shorts_music_strategy", "safe_ambient") == "safe_ambient"
+    ):
+        music = (
+            _procedural_ambient_track(directory),
+            {
+                "rights": "CLEARED",
+                "license": "Original procedural audio generated locally by Pixel Shorts Factory",
+                "source": "local",
+            },
+        )
     sfx = local_track(ROOT / "media_library/sfx")
     args = [ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", "concat.txt"]
     filters = []
     labels = ["[0:a]"]
     audio_index = 1
-    for track, volume, loop in [(music, 0.08, True), (sfx, 0.12, False)]:
+    music_volume = float(settings.get("background_music_volume", 0.06))
+    for track, volume, loop in [(music, music_volume, True), (sfx, 0.12, False)]:
         if not track:
             continue
         if loop:

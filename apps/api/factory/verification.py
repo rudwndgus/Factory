@@ -33,7 +33,10 @@ def authority(url):
         return 0.98, "authoritative first-party source"
     if host.endswith(".gov") or host.endswith(".edu"):
         return 0.9, "government or academic source"
-    if host in {"sciencedaily.com", "nature.com", "science.org", "arstechnica.com"}:
+    if host in {
+        "sciencedaily.com", "nature.com", "science.org", "arstechnica.com",
+        "livescience.com", "smithsonianmag.com", "atlasobscura.com",
+    }:
         return 0.76, "established editorial source"
     if host in {"youtube.com", "youtu.be"}:
         return 0.25, "trend signal only"

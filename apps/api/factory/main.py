@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -104,6 +105,11 @@ class OfficeInput(BaseModel):
                 datetime.strptime(slot, "%H:%M")
             except ValueError:
                 raise ValueError("Upload times must use HH:MM")
+        for window_value in (s["production_window_start"], s["production_window_end"]):
+            try:
+                datetime.strptime(window_value, "%H:%M")
+            except ValueError:
+                raise ValueError("Production window times must use HH:MM")
         if len(set(s["upload_times"])) < s["videos_per_day"]:
             raise ValueError("Provide a different publish time for every daily video")
         if not 0 < s["duplicate_threshold"] <= 1:
@@ -116,6 +122,12 @@ class OfficeInput(BaseModel):
             "Fully Automatic",
         ):
             raise ValueError("Invalid review policy")
+        if not 0 <= float(s["background_music_volume"]) <= 0.25:
+            raise ValueError("Background music volume must be between 0 and 0.25")
+        if s["shorts_music_strategy"] not in ("safe_ambient", "youtube_app_trending", "none"):
+            raise ValueError("Invalid Shorts music strategy")
+        if not 0 <= float(s["minimum_viral_score"]) <= 1:
+            raise ValueError("Minimum viral score must be between 0 and 1")
         if not 0 <= float(s["exploration_percentage"]) <= 100:
             raise ValueError("Exploration percentage must be between 0 and 100")
         if not 5 <= int(s["missed_slot_delay_minutes"]) <= 1440:
@@ -337,6 +349,7 @@ def snapshot(id: str):
         ).fetchone()
     return dict(
         office=office,
+        production_window_open=engine.production_window_open(office["settings"]),
         jobs=jobs,
         production_queue=engine.queue_items(id),
         employees=employees,
@@ -459,6 +472,29 @@ def archive_report(id: str, report_id: str):
     return {"ok": True}
 
 
+@app.post("/api/offices/{id}/reports/{report_id}/restore", dependencies=[Depends(require_owner)])
+def restore_report(id: str, report_id: str):
+    exists(id)
+    found = next((row for row in db.rows("reports", id) if row["id"] == report_id), None)
+    if not found:
+        raise HTTPException(404, "Report not found")
+    db.put("reports", id, found["data"] | {"archived": False}, found["video_id"], report_id)
+    return {"ok": True}
+
+
+@app.delete("/api/offices/{id}/reports/{report_id}", dependencies=[Depends(require_owner)])
+def delete_report(id: str, report_id: str):
+    exists(id)
+    with db.connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM reports WHERE id=? AND office_id=?", (report_id, id)
+        )
+    if not cursor.rowcount:
+        raise HTTPException(404, "Report not found")
+    db.event(id, "Owner deleted a report from the report library")
+    return {"ok": True}
+
+
 @app.post("/api/offices/{id}/analytics/refresh", dependencies=[Depends(require_owner)])
 def analytics(id: str):
     exists(id)
@@ -471,6 +507,68 @@ def detail(id: str, video_id: str):
         table: db.rows(table, id, video_id)
         for table in ["qc_checks", "rights_records", "research_claims", "video_assets"]
     }
+
+
+@app.post(
+    "/api/offices/{id}/videos/{video_id}/library/{action}",
+    dependencies=[Depends(require_owner)],
+)
+def manage_video_library(id: str, video_id: str, action: Literal["archive", "restore"]):
+    exists(id)
+    v = video(id, video_id)
+    with db.connection() as connection:
+        active = connection.execute(
+            "SELECT 1 FROM jobs WHERE id=? AND office_id=? AND status IN ('QUEUED','PLANNED','RUNNING','RETRYING','WAITING')",
+            (video_id, id),
+        ).fetchone()
+    if active:
+        raise ValueError("Remove or cancel active production before archiving this video")
+    archived = action == "archive"
+    v["archived"] = archived
+    v["archived_at"] = time.time() if archived else None
+    db.put("videos", id, v, video_id, video_id)
+    db.event(id, "Video archived" if archived else "Video restored", video_id=video_id)
+    return {"ok": True, "archived": archived}
+
+
+@app.delete(
+    "/api/offices/{id}/videos/{video_id}/library",
+    dependencies=[Depends(require_owner)],
+)
+def delete_video_library(id: str, video_id: str):
+    exists(id)
+    v = video(id, video_id)
+    if v.get("youtube_video_id") or v.get("youtube_id"):
+        raise ValueError("Uploaded YouTube videos cannot be deleted here. Archive it, or delete it in YouTube Studio first.")
+    with db.connection() as connection:
+        job = connection.execute(
+            "SELECT status FROM jobs WHERE id=? AND office_id=?", (video_id, id)
+        ).fetchone()
+        if job and job["status"] in engine.ACTIVE_JOB_STATUSES:
+            raise ValueError("Remove or cancel active production before deleting this video")
+        for table in (
+            "video_scenes", "video_assets", "video_scripts", "job_attempts", "errors",
+            "qc_checks", "rights_records", "research_claims", "analytics_snapshots",
+            "reports", "cost_events", "usage_events", "approval_claims", "upload_claims",
+            "publish_slot_claims",
+        ):
+            if table in db.TABLES:
+                connection.execute(
+                    f"DELETE FROM {table} WHERE office_id=? AND (video_id=? OR id=?)",
+                    (id, video_id, video_id),
+                )
+            else:
+                connection.execute(
+                    f"DELETE FROM {table} WHERE office_id=? AND video_id=?", (id, video_id)
+                )
+        connection.execute("DELETE FROM jobs WHERE id=? AND office_id=?", (video_id, id))
+        connection.execute("DELETE FROM active_topic_jobs WHERE job_id=?", (video_id,))
+        connection.execute("DELETE FROM videos WHERE id=? AND office_id=?", (video_id, id))
+    folder = (MEDIA / id / video_id).resolve()
+    if folder.is_relative_to(MEDIA.resolve()) and folder.is_dir():
+        shutil.rmtree(folder)
+    db.event(id, "Owner permanently deleted a local video and its generated assets", video_id=video_id)
+    return {"ok": True}
 
 
 @app.post(
@@ -721,10 +819,17 @@ def publish(id: str, video_id: str, body: PublishInput):
     result = youtube.OfficialYouTube(id).upload(
         v, MEDIA / v["file"], body.privacy, body.publish_at
     )
-    v["status"] = "SCHEDULED" if body.publish_at else "PUBLISHED"
+    v["status"] = (
+        "SCHEDULED"
+        if body.publish_at
+        else "PUBLISHED"
+        if body.privacy == "public"
+        else "UPLOADED_PRIVATE"
+    )
     v["youtube_id"] = result["youtube_id"]
     v["youtube_video_id"] = result["youtube_id"]
     v["youtube_upload_at"] = result.get("uploaded_at")
+    v["youtube_privacy"] = result.get("privacy", body.privacy)
     v["scheduled_publish_at"] = body.publish_at or v.get("scheduled_publish_at")
     v["published_at"] = result.get("published_at")
     db.put("videos", id, v, video_id, video_id)

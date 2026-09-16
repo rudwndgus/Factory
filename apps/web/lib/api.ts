@@ -19,6 +19,7 @@ export type Office = {
 };
 export type Snapshot = {
   office: Office;
+  production_window_open: boolean;
   employees: Employee[];
   jobs: any[];
   production_queue: any[];

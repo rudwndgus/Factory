@@ -40,12 +40,22 @@ def _save(office_id, plan):
 def _slot_times(settings, now):
     zone = ZoneInfo(settings["timezone"])
     local_now = datetime.fromtimestamp(now, zone)
+    target_day = local_now
+    if settings.get("production_window_enabled", False):
+        start_hour, start_minute = map(int, settings.get("production_window_start", "18:00").split(":"))
+        end_hour, end_minute = map(int, settings.get("production_window_end", "09:00").split(":"))
+        start_minutes = start_hour * 60 + start_minute
+        end_minutes = end_hour * 60 + end_minute
+        current_minutes = local_now.hour * 60 + local_now.minute
+        if start_minutes > end_minutes and current_minutes >= end_minutes:
+            # A cross-midnight shift beginning tonight produces tomorrow's upload batch.
+            target_day = local_now + timedelta(days=1)
     delay = max(5, int(settings.get("missed_slot_delay_minutes", 30)))
     catchup = 0
     slots = []
     for index, value in enumerate(settings["upload_times"][: settings["videos_per_day"]]):
         hour, minute = map(int, value.split(":"))
-        intended = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        intended = target_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
         effective = intended
         note = None
         if intended.timestamp() <= now + 600:
@@ -69,7 +79,7 @@ def _slot_times(settings, now):
                 "published_at": None,
             }
         )
-    return local_now.strftime("%Y-%m-%d"), slots
+    return target_day.strftime("%Y-%m-%d"), slots
 
 
 def ensure_plan(office_id, now=None, create_jobs=True):
@@ -91,6 +101,19 @@ def ensure_plan(office_id, now=None, create_jobs=True):
         }
         _save(office_id, plan)
         db.event(office_id, f"Daily plan created: {date}, target {settings['videos_per_day']} videos")
+    else:
+        existing_indices = {slot.get("index") for slot in plan.get("publish_slots", [])}
+        added_slots = [slot for slot in new_slots if slot["index"] not in existing_indices]
+        if added_slots or plan.get("target_video_count") != settings["videos_per_day"]:
+            plan["publish_slots"].extend(added_slots)
+            plan["target_video_count"] = settings["videos_per_day"]
+            plan["timezone"] = settings["timezone"]
+            _save(office_id, plan)
+            if added_slots:
+                db.event(
+                    office_id,
+                    f"Daily plan expanded to {settings['videos_per_day']} configured video slots",
+                )
     reconcile(office_id, plan, now, create_jobs)
     return get(office_id, date)
 
@@ -307,7 +330,7 @@ def reconcile(office_id, plan=None, now=None, create_jobs=True):
                 selection_reason="Ranked by freshness, curiosity, authority, category weight, trend, channel history and exploration",
                 video_id=job_id,
                 job_id=job_id,
-                status="PRODUCING",
+                status="QUEUED",
                 category=topic.get("category"),
                 category_family=topic.get("category_family"),
                 category_selection_reason=topic.get("category_selection_reason"),

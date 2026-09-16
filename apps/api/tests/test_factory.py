@@ -35,6 +35,12 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("MASTER_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("OWNER_PASSWORD", "test-owner-password-123456")
     db.migrate()
+    office = db.offices()[0]
+    with db.connection() as connection:
+        connection.execute(
+            "UPDATE office_settings SET payload=? WHERE office_id=?",
+            (json.dumps(office["settings"] | {"minimum_viral_score": 0}), office["id"]),
+        )
 
 
 def first():
@@ -663,11 +669,11 @@ def test_daily_plan_is_persistent_unique_and_restart_safe():
     seed_topics(office_id)
     engine.set_mode(office_id, "RUNNING")
     plan = planning.ensure_plan(office_id, now=1_800_000_000)
-    assert plan["target_video_count"] == 3
-    assert len(plan["publish_slots"]) == 3
-    assert len({slot["topic_id"] for slot in plan["publish_slots"]}) == 3
-    assert len({slot["job_id"] for slot in plan["publish_slots"]}) == 3
-    assert len({slot["scheduled_publish_at"] for slot in plan["publish_slots"]}) == 3
+    assert plan["target_video_count"] == 5
+    assert len(plan["publish_slots"]) == 5
+    assert len({slot["topic_id"] for slot in plan["publish_slots"]}) == 5
+    assert len({slot["job_id"] for slot in plan["publish_slots"]}) == 5
+    assert len({slot["scheduled_publish_at"] for slot in plan["publish_slots"]}) == 5
     with db.connection() as connection:
         original_jobs = connection.execute("SELECT count(*) FROM jobs").fetchone()[0]
     db.migrate()
@@ -732,8 +738,8 @@ def test_daily_plan_uses_distinct_categories_and_semantic_topics():
     engine.set_mode(office_id, "RUNNING")
     plan = planning.ensure_plan(office_id, now=1_800_000_000)
     slots = plan["publish_slots"]
-    assert len({slot["category_family"] for slot in slots}) == 3
-    assert len({slot["scheduled_publish_at"] for slot in slots}) == 3
+    assert len({slot["category_family"] for slot in slots}) == 5
+    assert len({slot["scheduled_publish_at"] for slot in slots}) == 5
     for index, left in enumerate(slots):
         for right in slots[index + 1:]:
             assert topics.topic_similarity(left["topic_title"], right["topic_title"]) < 0.78
@@ -1008,6 +1014,104 @@ def test_upload_claim_blocks_a_second_process():
         youtube.claim_upload(office_id, "claim-video")
     youtube.finish_upload_claim(office_id, "claim-video", "needs_reconciliation")
     youtube.claim_upload(office_id, "claim-video")
+
+
+def test_overnight_production_window_uses_office_timezone():
+    from zoneinfo import ZoneInfo
+
+    settings = {
+        "production_window_enabled": True,
+        "production_window_start": "18:00",
+        "production_window_end": "09:00",
+        "timezone": "America/New_York",
+    }
+    evening = datetime(2030, 1, 2, 19, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    morning = datetime(2030, 1, 3, 8, 59, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    daytime = datetime(2030, 1, 3, 12, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    assert engine.production_window_open(settings, evening)
+    assert engine.production_window_open(settings, morning)
+    assert not engine.production_window_open(settings, daytime)
+
+
+def test_overnight_shift_creates_one_next_day_batch_across_midnight():
+    from zoneinfo import ZoneInfo
+
+    office_id = first()
+    office = db.office(office_id)
+    settings = office["settings"] | {
+        "timezone": "America/New_York",
+        "production_window_enabled": True,
+        "production_window_start": "18:00",
+        "production_window_end": "09:00",
+    }
+    with db.connection() as connection:
+        connection.execute(
+            "UPDATE office_settings SET payload=? WHERE office_id=?",
+            (json.dumps(settings), office_id),
+        )
+    seed_topics(office_id, 10)
+    engine.set_mode(office_id, "RUNNING")
+    evening = datetime(2030, 1, 2, 19, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    after_midnight = datetime(2030, 1, 3, 1, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    first_plan = planning.ensure_plan(office_id, now=evening)
+    second_plan = planning.ensure_plan(office_id, now=after_midnight)
+    assert first_plan["date"] == "2030-01-03"
+    assert second_plan["date"] == first_plan["date"]
+    assert [slot["job_id"] for slot in second_plan["publish_slots"]] == [
+        slot["job_id"] for slot in first_plan["publish_slots"]
+    ]
+
+
+def test_viral_scoring_prefers_mystery_over_administration_news():
+    exciting = topics.viral_potential({
+        "title": "The Unexplained Ancient City That Suddenly Vanished",
+        "category": "Mystery",
+        "trend_signal": 0.7,
+    })
+    boring = topics.viral_potential({
+        "title": "Agency Names University to Host Annual Meeting",
+        "category": "Fresh",
+        "trend_signal": 0,
+    })
+    assert exciting >= 0.75
+    assert boring < 0.35
+
+
+def test_default_ambient_bgm_is_generated_locally(tmp_path):
+    from factory import media
+
+    path = media._procedural_ambient_track(tmp_path)
+    assert path.is_file() and path.stat().st_size > 100_000
+    assert 15.5 <= media.duration(path) <= 16.5
+
+
+def test_video_library_archive_restore_and_local_delete():
+    office_id = first()
+    db.put("videos", office_id, {
+        "id": "library-video", "title": "Manage me", "status": "FAILED",
+        "test_mode": False,
+    }, "library-video", "library-video")
+    response = client().post(f"/api/offices/{office_id}/videos/library-video/library/archive")
+    assert response.status_code == 200 and response.json()["archived"] is True
+    response = client().post(f"/api/offices/{office_id}/videos/library-video/library/restore")
+    assert response.status_code == 200 and response.json()["archived"] is False
+    response = client().delete(f"/api/offices/{office_id}/videos/library-video/library")
+    assert response.status_code == 200
+    assert not db.rows("videos", office_id, "library-video")
+
+
+def test_uploaded_video_can_archive_but_not_local_delete():
+    office_id = first()
+    db.put("videos", office_id, {
+        "id": "uploaded-video", "title": "Already on YouTube", "status": "UPLOADED_PRIVATE",
+        "youtube_video_id": "youtube-id", "test_mode": False,
+    }, "uploaded-video", "uploaded-video")
+    assert client().post(
+        f"/api/offices/{office_id}/videos/uploaded-video/library/archive"
+    ).status_code == 200
+    response = client().delete(f"/api/offices/{office_id}/videos/uploaded-video/library")
+    assert response.status_code == 400
+    assert "YouTube Studio" in response.json()["detail"]
 
 
 def test_writer_rejects_narration_far_below_target(monkeypatch):

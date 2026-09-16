@@ -1042,6 +1042,21 @@ footer a {
   margin-top: 8px;
 }
 
+.status-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  border: 1px solid var(--line);
+  background: #f6efd8;
+  font-size: 12px;
+}
+.status-strip.ok {
+  background: #e5f0df;
+}
+
 .queue-card .job-icon b {
   font-size: 1rem;
 }

@@ -271,3 +271,13 @@ docker/             backend/frontend images and reverse proxy
 media_library/      rights-cleared optional audio
 data/               private runtime data (gitignored)
 ```
+
+## Overnight five-video workflow
+
+- Settings controls videos per day, unique YouTube publish times, Office timezone, production window, approval policy, automatic publishing, viral threshold, and background music.
+- An overnight window such as `18:00` to `09:00` crosses midnight correctly. Planning may remain active, but rendering work only starts inside the configured window.
+- `Review Everything` automatically produces videos and waits for the owner. `Fully Automatic` plus automatic upload schedules videos after all safety gates pass.
+- Curiosity ranking favors verified mystery, strange-world, discovery, and current high-interest stories while penalizing administrative announcements, gameplay, and trailers.
+- The default BGM is an original quiet procedural ambient bed generated locally. Commercial trending Shorts sounds must be added with YouTube's Shorts creation tools; the upload API cannot attach their Shorts license.
+- Video Library supports Approve & Schedule, Archive, Restore, and safe local Delete. Videos already uploaded to YouTube can be archived but must be deleted from YouTube Studio.
+- Reports support archive, restore, and delete. YouTube Analytics continues collecting views, response, retention, and relative performance after publication.

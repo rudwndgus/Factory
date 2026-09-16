@@ -36,6 +36,8 @@ import {
   Menu,
   Trash2,
   CalendarClock,
+  Archive,
+  RotateCcw,
 } from "lucide-react";
 import {
   api,
@@ -133,6 +135,7 @@ export default function Page() {
   const [imageProviderTest, setImageProviderTest] = useState<any>(null);
   const [zeroCostStatus, setZeroCostStatus] = useState<any>(null);
   const [showTestVideos, setShowTestVideos] = useState(false);
+  const [showArchivedVideos, setShowArchivedVideos] = useState(false);
   const [server, setServer] = useState("http://localhost:8000"),
     [password, setPassword] = useState("");
   const controller = useRef<AbortController | null>(null);
@@ -159,9 +162,14 @@ export default function Page() {
   const activeEmployees = (snap?.employees || []).filter(
     (employee) => employee.status === "WORKING",
   );
-  const productionVideos = videos.filter((video) => !video.data.test_mode);
-  const testVideos = videos.filter((video) => video.data.test_mode);
-  const visibleVideos = showTestVideos ? testVideos : productionVideos;
+  const productionVideos = videos.filter((video) => !video.data.test_mode && !video.data.archived);
+  const archivedVideos = videos.filter((video) => !video.data.test_mode && video.data.archived);
+  const testVideos = videos.filter((video) => video.data.test_mode && !video.data.archived);
+  const visibleVideos = showTestVideos
+    ? testVideos
+    : showArchivedVideos
+      ? archivedVideos
+      : productionVideos;
   const dailyPlan = snap?.daily_production_plans?.[0]?.data;
   const today = new Date().toISOString().slice(0, 10);
   const costs = snap?.cost_events || [];
@@ -324,6 +332,21 @@ export default function Page() {
     } catch (e) {
       setError((e as Error).message);
     }
+  }
+  function manageVideo(v: RecordRow, action: "archive" | "restore" | "delete") {
+    const question = action === "delete"
+      ? "이 로컬 영상과 생성 파일을 영구 삭제할까요? YouTube에 올라간 영상은 여기서 삭제할 수 없습니다."
+      : action === "archive"
+        ? "이 영상을 보관함으로 이동할까요?"
+        : "이 영상을 Video Library로 복원할까요?";
+    if (!confirm(question)) return;
+    void act(
+      () => api(
+        root + `/videos/${v.id}/library${action === "delete" ? "" : `/${action}`}`,
+        action === "delete" ? "DELETE" : "POST",
+      ),
+      action === "delete" ? "로컬 영상을 삭제했습니다." : action === "archive" ? "보관함으로 이동했습니다." : "영상 라이브러리로 복원했습니다.",
+    );
   }
   function videoStatus(value: string) {
     const labels: Record<string, string> = {
@@ -866,6 +889,14 @@ export default function Page() {
             </>
           ) : tab === "Production" ? (
             <section className="panel list-panel">
+              {office?.settings.production_window_enabled && (
+                <div className={"status-strip " + (snap?.production_window_open ? "ok" : "warn")}>
+                  <strong>{snap?.production_window_open ? "Overnight production window is OPEN" : "Queued for the overnight production window"}</strong>
+                  <span>
+                    {office.settings.production_window_start}–{office.settings.production_window_end} {office.settings.timezone}
+                  </span>
+                </div>
+              )}
               {dailyPlan && (
                 <div className="daily-plan">
                   <div>
@@ -995,6 +1026,10 @@ export default function Page() {
                         {t.data.provider || "OWNER SOURCE"} · {t.data.status}
                       </span>
                       <h3>{t.data.title}</h3>
+                      <p>
+                        Viral potential: {Math.round((t.data.viral_potential || 0) * 100)}%
+                        {t.data.popularity_signal ? ` · ${t.data.popularity_signal}` : ""}
+                      </p>
                       <p>{t.data.summary?.slice(0, 200)}</p>
                       {/^https?:\/\//.test(t.data.source_url || "") && (
                         <a
@@ -1077,14 +1112,20 @@ export default function Page() {
                 <h2>Video library</h2>
                 <div className="toolbar">
                   <button
-                    className={"btn " + (!showTestVideos ? "primary" : "")}
-                    onClick={() => setShowTestVideos(false)}
+                    className={"btn " + (!showTestVideos && !showArchivedVideos ? "primary" : "")}
+                    onClick={() => { setShowTestVideos(false); setShowArchivedVideos(false); }}
                   >
                     Productions {productionVideos.length}
                   </button>
                   <button
+                    className={"btn " + (showArchivedVideos ? "primary" : "")}
+                    onClick={() => { setShowTestVideos(false); setShowArchivedVideos(true); }}
+                  >
+                    Archive {archivedVideos.length}
+                  </button>
+                  <button
                     className={"btn " + (showTestVideos ? "primary" : "")}
-                    onClick={() => setShowTestVideos(true)}
+                    onClick={() => { setShowTestVideos(true); setShowArchivedVideos(false); }}
                   >
                     Test runs {testVideos.length}
                   </button>
@@ -1145,6 +1186,22 @@ export default function Page() {
                           </button>
                         </div>
                       )}
+                      <div className="video-actions manage-actions">
+                        {v.data.archived ? (
+                          <button className="btn" disabled={busy} onClick={() => manageVideo(v, "restore")}>
+                            <RotateCcw size={14} /> Restore
+                          </button>
+                        ) : (
+                          <button className="btn" disabled={busy} onClick={() => manageVideo(v, "archive")}>
+                            <Archive size={14} /> Archive
+                          </button>
+                        )}
+                        {!v.data.youtube_video_id && !v.data.youtube_id && (
+                          <button className="btn danger" disabled={busy} onClick={() => manageVideo(v, "delete")}>
+                            <Trash2 size={14} /> Delete
+                          </button>
+                        )}
+                      </div>
                     </article>
                   ))}
                 </div>
@@ -1767,6 +1824,32 @@ export default function Page() {
                     <Check size={15} /> 확인 완료 · 정리함으로 이동
                   </button>
                 )}
+                {reports.find((r) => r.id === selected)?.data.archived && (
+                  <button
+                    className="btn full"
+                    onClick={() =>
+                      void act(async () => {
+                        await api(root + `/reports/${selected}/restore`, "POST");
+                        setModal(null);
+                        setReportShelf("inbox");
+                      }, "보고서를 확인 대기로 복원했습니다.")
+                    }
+                  >
+                    <RotateCcw size={15} /> 확인 대기로 복원
+                  </button>
+                )}
+                <button
+                  className="btn danger full"
+                  onClick={() => {
+                    if (!confirm("이 보고서를 영구 삭제할까요? 영상 자체는 삭제되지 않습니다.")) return;
+                    void act(async () => {
+                      await api(root + `/reports/${selected}`, "DELETE");
+                      setModal(null);
+                    }, "보고서를 삭제했습니다.");
+                  }}
+                >
+                  <Trash2 size={15} /> 보고서 삭제
+                </button>
               </>
             ) : modal === "video" ? (
               <>
@@ -1966,6 +2049,14 @@ export default function Page() {
                       : "Next available slot"}
                   </p>
                   <p>{detail?.approval_preview?.timezone}</p>
+                  <p>
+                    Music: {detail?.background_music?.note || "Copyright-safe quiet ambient BGM"}
+                  </p>
+                  {office?.settings.shorts_music_strategy === "youtube_app_trending" && (
+                    <p className="warning-note">
+                      Trending Shorts music cannot be attached by the upload API. Download this video and add the licensed sound inside the YouTube Shorts creation tool before publishing.
+                    </p>
+                  )}
                   <p>YouTube: private upload → scheduled public release</p>
                   {detail?.approval_preview?.reschedule_reason && (
                     <p className="warning-note">{detail.approval_preview.reschedule_reason}</p>
@@ -2121,6 +2212,14 @@ function OfficeForm({
             duration: Number(f.get("duration")),
             videos_per_day: Number(f.get("videos_per_day")),
             timezone: f.get("timezone"),
+            production_window_enabled: f.get("production_window_enabled") === "on",
+            production_window_start: f.get("production_window_start"),
+            production_window_end: f.get("production_window_end"),
+            background_music_enabled: f.get("background_music_enabled") === "on",
+            background_music_volume: Number(f.get("background_music_volume")),
+            shorts_music_strategy: f.get("shorts_music_strategy"),
+            content_profile: f.get("content_profile"),
+            minimum_viral_score: Number(f.get("minimum_viral_score")),
             upload_times: String(f.get("upload_times"))
               .split(",")
               .map((x) => x.trim()),
@@ -2316,8 +2415,20 @@ function OfficeForm({
             type="number"
             min={1}
             max={24}
-            defaultValue={s?.videos_per_day || 3}
+            defaultValue={s?.videos_per_day || 5}
           />
+        </label>
+        <label>
+          Content profile
+          <select name="content_profile" defaultValue={s?.content_profile || "Viral Curiosity"}>
+            <option>Viral Curiosity</option>
+            <option>Balanced Educational</option>
+            <option>Mystery First</option>
+          </select>
+        </label>
+        <label>
+          Minimum viral potential
+          <input name="minimum_viral_score" type="number" min={0} max={1} step="0.05" defaultValue={s?.minimum_viral_score ?? 0.35} />
         </label>
         <label>
           Daily budget (USD)
@@ -2344,10 +2455,18 @@ function OfficeForm({
           <input name="timezone" defaultValue={s?.timezone || "UTC"} />
         </label>
         <label>
+          Production starts
+          <input name="production_window_start" type="time" defaultValue={s?.production_window_start || "18:00"} />
+        </label>
+        <label>
+          Production stops
+          <input name="production_window_end" type="time" defaultValue={s?.production_window_end || "09:00"} />
+        </label>
+        <label>
           YouTube publish times
           <input
             name="upload_times"
-            defaultValue={s?.upload_times?.join(",") || "09:00,15:00,21:00"}
+            defaultValue={s?.upload_times?.join(",") || "10:00,12:30,15:00,17:30,20:00"}
           />
         </label>
         <label>
@@ -2368,6 +2487,18 @@ function OfficeForm({
             <option value="unlisted">Unlisted</option>
             <option value="public">Public / scheduled</option>
           </select>
+        </label>
+        <label>
+          Shorts music strategy
+          <select name="shorts_music_strategy" defaultValue={s?.shorts_music_strategy || "safe_ambient"}>
+            <option value="safe_ambient">Safe original ambient BGM</option>
+            <option value="youtube_app_trending">Add trending sound manually in YouTube app</option>
+            <option value="none">Voice only</option>
+          </select>
+        </label>
+        <label>
+          Background music volume
+          <input name="background_music_volume" type="number" min={0} max={0.25} step="0.01" defaultValue={s?.background_music_volume ?? 0.06} />
         </label>
         <label>
           Exploration percentage
@@ -2395,7 +2526,7 @@ function OfficeForm({
         <textarea
           name="topic_sources"
           rows={2}
-          defaultValue={(s?.topic_sources || ["NASA", "NOAA", "USGS", "ScienceDaily", "Ars Technica", "YouTube Trends"]).join(", ")}
+          defaultValue={(s?.topic_sources || ["NASA", "NOAA", "USGS", "ScienceDaily", "Ars Technica", "Live Science", "Smithsonian Smart News", "Atlas Obscura", "Google News Curiosity", "YouTube Trends"]).join(", ")}
         />
       </label>
       <label>
@@ -2404,18 +2535,34 @@ function OfficeForm({
           name="weights"
           defaultValue={JSON.stringify(
             s?.category_weights || {
-              Fresh: 35,
-              "Science / Space": 20,
-              Mystery: 15,
-              "Strange World": 15,
-              Evergreen: 10,
-              Experimental: 5,
+              Fresh: 20,
+              "Science / Space": 15,
+              Mystery: 30,
+              "Strange World": 25,
+              Evergreen: 7,
+              Experimental: 3,
             },
             null,
             2,
           )}
           rows={5}
         />
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          name="production_window_enabled"
+          defaultChecked={s?.production_window_enabled ?? false}
+        />{" "}
+        Only produce during the configured overnight work window
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          name="background_music_enabled"
+          defaultChecked={s?.background_music_enabled ?? true}
+        />{" "}
+        Mix quiet copyright-safe background music into rendered videos
       </label>
       <label className="checkbox">
         <input

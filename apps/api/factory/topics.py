@@ -19,8 +19,9 @@ from .providers import similarity
 
 
 class RSSSource:
-    def __init__(self, name, url, category, authority):
+    def __init__(self, name, url, category, authority, trend_signal=0.0):
         self.name, self.url, self.category, self.authority = name, url, category, authority
+        self.trend_signal = trend_signal
 
     def discover(self, _office_id, _settings):
         response = httpx.get(self.url, timeout=20, follow_redirects=True)
@@ -50,7 +51,12 @@ class RSSSource:
                         "status": "candidate",
                         "category": self.category,
                         "source_authority": self.authority,
-                        "trend_signal": 0.0,
+                        "trend_signal": self.trend_signal,
+                        "popularity_signal": (
+                            "Current high-interest editorial/news feed"
+                            if self.trend_signal
+                            else "Source freshness only"
+                        ),
                         "signal_only": False,
                         "discovered_at": time.time(),
                     }
@@ -111,12 +117,23 @@ SOURCE_FACTORIES = {
     "USGS": lambda: RSSSource("USGS", "https://www.usgs.gov/feeds/news.xml", "Strange World", 0.98),
     "ScienceDaily": lambda: RSSSource("ScienceDaily", "https://www.sciencedaily.com/rss/top/science.xml", "Science / Space", 0.76),
     "Ars Technica": lambda: RSSSource("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "Fresh", 0.76),
+    "Live Science": lambda: RSSSource("Live Science", "https://www.livescience.com/feeds/all", "Strange World", 0.78, 0.45),
+    "Smithsonian Smart News": lambda: RSSSource("Smithsonian Smart News", "https://www.smithsonianmag.com/rss/smart-news/", "Evergreen", 0.80, 0.40),
+    "Atlas Obscura": lambda: RSSSource("Atlas Obscura", "https://www.atlasobscura.com/feeds/latest", "Mystery", 0.70, 0.45),
+    "Google News Curiosity": lambda: RSSSource(
+        "Google News Curiosity",
+        "https://news.google.com/rss/search?q=unexplained%20mystery%20OR%20strange%20discovery%20OR%20bizarre%20science%20when%3A2d&hl=en-US&gl=US&ceid=US%3Aen",
+        "Mystery",
+        0.60,
+        0.70,
+    ),
     "YouTube Trends": YouTubeTrendSource,
 }
 
 RESEARCH_HOSTS = (
     "nasa.gov", "noaa.gov", "usgs.gov", "nih.gov", "science.org",
-    "sciencedaily.com", "arstechnica.com", "wikipedia.org",
+    "sciencedaily.com", "arstechnica.com", "wikipedia.org", "livescience.com",
+    "smithsonianmag.com", "atlasobscura.com",
 )
 USER_AGENT = "PixelShortsFactory/1.0 research (owner-operated)"
 
@@ -153,6 +170,32 @@ def topic_similarity(left, right):
     union = words_left | words_right
     overlap = len(words_left & words_right) / len(union) if union else 0.0
     return max(sequence, overlap)
+
+
+VIRAL_HOOKS = (
+    "mystery", "unexplained", "vanished", "disappeared", "secret", "hidden",
+    "bizarre", "strange", "impossible", "never", "lost", "buried", "ancient",
+    "discovered", "found", "unexpected", "surprise", "rare", "unknown", "eerie",
+    "creature", "anomaly", "terrifying", "first ever", "scientists can't",
+)
+LOW_INTEREST_MARKERS = (
+    "names university", "appointed", "annual meeting", "training program",
+    "walkthrough gameplay", "official trailer", "press release", "funding announced",
+)
+
+
+def viral_potential(topic):
+    """Free, explainable hook score; popularity signals remain separately visible."""
+    title = topic.get("title", "").lower()
+    hook_hits = sum(marker in title for marker in VIRAL_HOOKS)
+    penalty = sum(marker in title for marker in LOW_INTEREST_MARKERS)
+    trend = max(0.0, min(1.0, float(topic.get("trend_signal", 0))))
+    mystery = normalize_category(topic.get("category", ""), title) in ("Mystery", "Strange World")
+    score = 0.12 + min(0.48, hook_hits * 0.12) + trend * 0.30
+    score += 0.08 if "?" in title else 0.0
+    score += 0.08 if mystery else 0.0
+    score -= min(0.5, penalty * 0.25)
+    return round(max(0.0, min(1.0, score)), 3)
 
 
 def retrieve_evidence(source):
@@ -226,6 +269,7 @@ def discover(office_id):
         )
         if duplicate:
             continue
+        topic["viral_potential"] = viral_potential(topic)
         topic["id"] = db.uid()
         db.put("topics", office_id, topic, id=topic["id"])
         existing.append({"id": topic["id"], "data": topic})
@@ -254,16 +298,18 @@ def score_topic(office_id, topic, settings, now=None):
     category = normalize_category(topic.get("category", "Evergreen"), title)
     category_weight = float(settings.get("category_weights", {}).get(category, 0)) / 100
     trend = float(topic.get("trend_signal", 0))
+    viral = viral_potential(topic)
     history = _profile_index(office_id, "category", category)
     exploration_rate = float(settings.get("exploration_percentage", 15)) / 100
     stable_random = int(hashlib.sha256((topic.get("id", "") + str(now)[:5]).encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
     exploration = exploration_rate * stable_random
     components = {
         "freshness": freshness * 24,
-        "curiosity": curiosity * 22,
+        "curiosity": curiosity * 14,
+        "viral_hook_potential": viral * 18,
         "source_authority": authority * 18,
         "category_weight": category_weight * 14,
-        "trend_signal": trend * 12,
+        "trend_signal": trend * 14,
         "historical_performance": max(0.5, min(1.8, history)) / 1.8 * 8,
         "exploration_bonus": exploration * 10,
         "production_feasibility": (0.0 if topic.get("signal_only") else 1.0) * 5,
@@ -283,6 +329,12 @@ def ranked_candidates(office_id, excluded_ids=None):
             continue
         if topic.get("signal_only"):
             continue
+        viral = viral_potential(topic)
+        if (
+            viral < float(office["settings"].get("minimum_viral_score", 0.35))
+            and not topic.get("pinned")
+        ):
+            continue
         duplicate = max((similarity(topic["title"], v.get("title", "")) for v in prior_videos), default=0)
         if duplicate >= office["settings"]["duplicate_threshold"]:
             continue
@@ -291,6 +343,7 @@ def ranked_candidates(office_id, excluded_ids=None):
             topic.get("category", "Evergreen"), topic.get("title", "")
         )
         topic["topic_score"] = score
+        topic["viral_potential"] = viral
         topic["score_breakdown"] = breakdown | {"duplicate_similarity": round(duplicate, 3)}
         candidates.append(topic)
     return sorted(candidates, key=lambda item: (item["topic_score"], item.get("pinned", False)), reverse=True)

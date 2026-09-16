@@ -560,9 +560,36 @@ def run_stage(job):
     elif stage == 6:
         media.subtitles(directory, video["scenes"])
     elif stage == 7:
-        media.render(directory, video["scenes"], cancelled)
+        media.render(directory, video["scenes"], cancelled, settings)
         video["file"] = str((directory / "final.mp4").relative_to(MEDIA))
         video["preview"] = str((directory / "preview.jpg").relative_to(MEDIA))
+        strategy = settings.get("shorts_music_strategy", "safe_ambient")
+        video["background_music"] = {
+            "strategy": strategy,
+            "embedded": bool(settings.get("background_music_enabled", True) and strategy == "safe_ambient"),
+            "volume": float(settings.get("background_music_volume", 0.06)),
+            "rights": "CLEARED" if strategy == "safe_ambient" else "OWNER_ACTION_REQUIRED",
+            "note": (
+                "Original quiet procedural ambient bed mixed locally"
+                if strategy == "safe_ambient"
+                else "Add a licensed trending sound using the YouTube Shorts creation tools before publication"
+                if strategy == "youtube_app_trending"
+                else "No background music"
+            ),
+        }
+        if strategy == "safe_ambient" and settings.get("background_music_enabled", True):
+            db.put(
+                "rights_records",
+                office_id,
+                {
+                    "type": "background_music",
+                    "rights": "CLEARED",
+                    "license": "Original procedural audio generated locally by Pixel Shorts Factory",
+                    "volume": float(settings.get("background_music_volume", 0.06)),
+                },
+                id,
+                id=f"{id}-background-music",
+            )
     elif stage == 8:
         video["status"] = "QC"
         checks = media.technical_qc(directory / "final.mp4")
@@ -630,6 +657,24 @@ class StagePaused(Exception):
     pass
 
 
+def production_window_open(settings, now=None):
+    """Return whether production work may start in the Office's local timezone."""
+    if not settings.get("production_window_enabled", False):
+        return True
+    now = now or time.time()
+    local = datetime.fromtimestamp(now, ZoneInfo(settings.get("timezone", "UTC")))
+    current = local.hour * 60 + local.minute
+    start_hour, start_minute = map(int, settings.get("production_window_start", "18:00").split(":"))
+    end_hour, end_minute = map(int, settings.get("production_window_end", "09:00").split(":"))
+    start = start_hour * 60 + start_minute
+    end = end_hour * 60 + end_minute
+    if start == end:
+        return True
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
 def tick():
     if not LOCK.acquire(blocking=False):
         return
@@ -637,14 +682,14 @@ def tick():
         with db.connection() as c:
             c.execute("BEGIN IMMEDIATE")
             jobs = c.execute(
-                "SELECT j.*,o.mode FROM jobs j JOIN offices o ON j.office_id=o.id WHERE j.status IN ('QUEUED','RETRYING','WAITING') AND j.next_run<=? ORDER BY j.created",
+                "SELECT j.*,o.mode,s.payload AS settings_payload FROM jobs j JOIN offices o ON j.office_id=o.id JOIN office_settings s ON s.office_id=j.office_id WHERE j.status IN ('QUEUED','RETRYING','WAITING') AND j.next_run<=? ORDER BY j.created",
                 (time.time(),),
             ).fetchall()
             job = next(
                 (
                     dict(j)
                     for j in jobs
-                    if j["mode"] == "RUNNING"
+                    if (j["mode"] == "RUNNING" and production_window_open(json.loads(j["settings_payload"])))
                     or (
                         json.loads(j["payload"]).get("test_mode")
                         and j["mode"] not in ("EMERGENCY_STOP", "PAUSED", "MAINTENANCE")
@@ -845,10 +890,15 @@ def publish_approved():
                     publish_at,
                 )
                 v["status"] = (
-                    "SCHEDULED" if publish_at else "PUBLISHED"
+                    "SCHEDULED"
+                    if publish_at
+                    else "PUBLISHED"
+                    if office["settings"]["privacy"] == "public"
+                    else "UPLOADED_PRIVATE"
                 )
                 v["youtube_id"] = result["youtube_id"]
                 v["youtube_video_id"] = result["youtube_id"]
+                v["youtube_privacy"] = result.get("privacy", office["settings"]["privacy"])
                 v["youtube_upload_at"] = result.get("uploaded_at")
                 v["published_at"] = result.get("published_at")
                 db.put("videos", office["id"], v, v["id"], v["id"])
