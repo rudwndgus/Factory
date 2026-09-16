@@ -10,7 +10,7 @@ import random
 import re
 import time
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 
@@ -111,6 +111,40 @@ class YouTubeTrendSource:
         return [item for item in result if item["title"]]
 
 
+class BroadCuriosityNewsSource:
+    """Collect varied curiosity signals without turning examples into a topic list."""
+
+    name = "Google News Curiosity"
+    searches = (
+        ("Everyday Systems", "how it works OR why does OR hidden mechanism OR everyday design"),
+        ("Human & Mind", "human body discovery OR psychology discovery OR perception study"),
+        ("Nature & Animals", "rare phenomenon OR animal discovery OR ocean discovery OR weather mystery"),
+        ("History & Culture", "archaeology discovery OR strange history OR language mystery OR ancient find"),
+        ("Technology & Design", "new technology OR unusual engineering OR internet discovery OR AI discovery"),
+        ("Mystery", "documented unexplained event OR unresolved signal OR mysterious discovery"),
+        ("Hypothetical", "what if science OR counterintuitive physics OR thought experiment"),
+    )
+
+    def discover(self, office_id, settings):
+        del office_id, settings
+        found = []
+        for category, query in self.searches:
+            url = (
+                "https://news.google.com/rss/search?q="
+                + quote_plus(f"({query}) when:7d")
+                + "&hl=en-US&gl=US&ceid=US:en"
+            )
+            try:
+                found.extend(
+                    RSSSource(self.name, url, category, 0.62, 0.66).discover(None, None)
+                )
+            except (httpx.HTTPError, ET.ParseError):
+                continue
+        if not found:
+            raise RuntimeError("Broad curiosity news searches were unavailable")
+        return found
+
+
 SOURCE_FACTORIES = {
     "NASA": lambda: RSSSource("NASA", "https://www.nasa.gov/feed/", "Science / Space", 0.98),
     "NOAA": lambda: RSSSource("NOAA", "https://www.noaa.gov/rss.xml", "Strange World", 0.98),
@@ -120,13 +154,7 @@ SOURCE_FACTORIES = {
     "Live Science": lambda: RSSSource("Live Science", "https://www.livescience.com/feeds/all", "Strange World", 0.78, 0.45),
     "Smithsonian Smart News": lambda: RSSSource("Smithsonian Smart News", "https://www.smithsonianmag.com/rss/smart-news/", "Evergreen", 0.80, 0.40),
     "Atlas Obscura": lambda: RSSSource("Atlas Obscura", "https://www.atlasobscura.com/feeds/latest", "Mystery", 0.70, 0.45),
-    "Google News Curiosity": lambda: RSSSource(
-        "Google News Curiosity",
-        "https://news.google.com/rss/search?q=unexplained%20mystery%20OR%20strange%20discovery%20OR%20bizarre%20science%20when%3A2d&hl=en-US&gl=US&ceid=US%3Aen",
-        "Mystery",
-        0.60,
-        0.70,
-    ),
+    "Google News Curiosity": BroadCuriosityNewsSource,
     "YouTube Trends": YouTubeTrendSource,
 }
 
@@ -144,6 +172,12 @@ CATEGORY_FAMILIES = {
     "Strange World": ("strange", "world", "earth", "ocean", "weather", "animal", "geology", "usgs", "noaa"),
     "Evergreen": ("evergreen", "history", "how", "why", "everyday"),
     "Experimental": ("experimental", "experiment", "speculative", "hypothesis"),
+    "Everyday Systems": ("everyday", "building", "machine", "food", "transport", "infrastructure", "design"),
+    "Human & Mind": ("human", "body", "brain", "psychology", "perception", "health"),
+    "Nature & Animals": ("nature", "animal", "plant", "ocean", "weather", "rare phenomenon"),
+    "Technology & Design": ("technology", "engineering", "internet", "computer", "ai", "architecture"),
+    "History & Culture": ("history", "archaeology", "language", "culture", "ancient", "map"),
+    "Hypothetical": ("what if", "hypothetical", "thought experiment", "counterfactual"),
 }
 
 
@@ -177,6 +211,8 @@ VIRAL_HOOKS = (
     "bizarre", "strange", "impossible", "never", "lost", "buried", "ancient",
     "discovered", "found", "unexpected", "surprise", "rare", "unknown", "eerie",
     "creature", "anomaly", "terrifying", "first ever", "scientists can't",
+    "why", "how", "what happens", "what if", "inside", "behind", "actually",
+    "unexpected reason", "counterintuitive", "ordinary", "everyday", "discovery",
 )
 LOW_INTEREST_MARKERS = (
     "names university", "appointed", "annual meeting", "training program",
@@ -185,15 +221,20 @@ LOW_INTEREST_MARKERS = (
 
 
 def viral_potential(topic):
-    """Free, explainable hook score; popularity signals remain separately visible."""
+    """Score a broad curiosity gap, not only sensational mystery language."""
     title = topic.get("title", "").lower()
     hook_hits = sum(marker in title for marker in VIRAL_HOOKS)
     penalty = sum(marker in title for marker in LOW_INTEREST_MARKERS)
     trend = max(0.0, min(1.0, float(topic.get("trend_signal", 0))))
-    mystery = normalize_category(topic.get("category", ""), title) in ("Mystery", "Strange World")
-    score = 0.12 + min(0.48, hook_hits * 0.12) + trend * 0.30
+    category = normalize_category(topic.get("category", ""), title)
+    mystery = category in ("Mystery", "Strange World")
+    explanatory = any(marker in title for marker in (
+        "why", "how", "what happens", "what if", "reason", "inside", "behind",
+    ))
+    score = 0.12 + min(0.48, hook_hits * 0.11) + trend * 0.30
     score += 0.08 if "?" in title else 0.0
-    score += 0.08 if mystery else 0.0
+    score += 0.10 if explanatory else 0.0
+    score += 0.12 if mystery else 0.0
     score -= min(0.5, penalty * 0.25)
     return round(max(0.0, min(1.0, score)), 3)
 

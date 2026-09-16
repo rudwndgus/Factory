@@ -64,6 +64,41 @@ def test_visual_modes_and_provenance(monkeypatch, tmp_path):
         assert calls == ["real"] and asset["asset_source"] == "external"
 
 
+def test_curio_uses_canonical_identity_only_when_directed():
+    from factory import assets
+
+    settings = db.office(first())["settings"]
+    with_curio = assets.visual_plan(
+        "A hidden mechanism moves below the floor.",
+        "A surprising machine",
+        settings,
+        0,
+        {"include_curio": True, "curio_action": "wearing a safety helmet and pointing"},
+    )
+    assert with_curio["include_curio"] is True
+    assert "no mouth, no nose, no antenna" in with_curio["image_prompt"]
+    assert "warm-gold four-point star" in with_curio["image_prompt"]
+    assert "wearing a safety helmet" in with_curio["image_prompt"]
+
+    without_curio = assets.visual_plan(
+        "Show the entire mechanism.", "A surprising machine", settings, 1, {}
+    )
+    assert without_curio["include_curio"] is False
+    assert "Do not include Curio" in without_curio["image_prompt"]
+
+
+def test_curio_is_never_forced_into_every_scene():
+    from factory import assets
+
+    visuals = [
+        {"prompt": f"scene {index}", "include_curio": True, "curio_action": "observing"}
+        for index in range(5)
+    ]
+    curated = assets.curate_curio_appearances(visuals)
+    assert sum(item["include_curio"] for item in curated) == 3
+    assert any(not item["include_curio"] for item in curated)
+
+
 def test_documentary_never_fabricated(monkeypatch, tmp_path):
     from factory import assets
     from factory.providers import ConfigurationRequired
@@ -1075,6 +1110,17 @@ def test_viral_scoring_prefers_mystery_over_administration_news():
     })
     assert exciting >= 0.75
     assert boring < 0.35
+
+
+def test_broad_curiosity_question_can_qualify_without_mystery_language():
+    ordinary = topics.viral_potential({
+        "title": "Why Does This Everyday Machine Work That Way?",
+        "category": "Everyday Systems",
+        "trend_signal": 0.25,
+    })
+    assert ordinary >= 0.35
+    assert topics.normalize_category("Human & Mind", "") == "Human & Mind"
+    assert topics.normalize_category("History & Culture", "") == "History & Culture"
 
 
 def test_default_ambient_bgm_is_generated_locally(tmp_path):

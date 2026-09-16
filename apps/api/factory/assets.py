@@ -123,6 +123,33 @@ SPACE_SUMMARIES = ["지구를 배경으로 우주선 밖에 있는 우주인: �
     "우주선 내부 대화와 외부 무선 통신을 나란히 비교하는 장면"]
 
 
+CURIO_CANONICAL = (
+    "Include Curio, the exact recurring Curiosity Room mascot, naturally inside this scene. "
+    "Preserve the canonical approved design: a minimal non-human silhouette with the same rounded "
+    "head and compact body proportions, simple vertical oval navy eyes, no mouth, no nose, no antenna, "
+    "deep navy body, cream/off-white face, and one warm-gold four-point star emblem on the torso. "
+    "Keep the clean minimal flat illustration identity. Topic-specific clothing or props may be worn "
+    "over this unchanged character, but Curio must never become a realistic human or a different mascot. "
+)
+
+
+def curate_curio_appearances(visuals):
+    """Honor Director choices while preventing the mascot becoming wallpaper."""
+    cleaned = [dict(item) if isinstance(item, dict) else item for item in visuals]
+    appearances = [
+        index for index, item in enumerate(cleaned)
+        if isinstance(item, dict) and item.get("include_curio") is True
+    ]
+    maximum = max(1, (len(cleaned) + 1) // 2)
+    if len(appearances) > maximum:
+        keep = set(appearances[:maximum])
+        for index in appearances:
+            if index not in keep:
+                cleaned[index]["include_curio"] = False
+                cleaned[index]["curio_action"] = ""
+    return cleaned
+
+
 def visual_plan(narration, title, settings, index, proposed=None, space_test=False):
     proposed = proposed if isinstance(proposed, dict) else {}
     kind = proposed.get("kind", "cinematic")
@@ -131,16 +158,20 @@ def visual_plan(narration, title, settings, index, proposed=None, space_test=Fal
     subject = SPACE_VISUALS[index % len(SPACE_VISUALS)] if space_test else str(proposed.get("prompt") or narration)
     style = settings["visual_style_preset"]
     real = proposed.get("requires_real") is True or kind == "documentary"
+    include_curio = proposed.get("include_curio") is True and not real and kind != "diagram"
+    curio_action = str(proposed.get("curio_action") or "observing the subject")
     prompt = (f"Create a portrait still for an educational Short. Topic: {title}. Scene: {subject}. "
               f"Visual style: {style}. Strong central composition for 9:16 crop, detailed textures, cinematic lighting. "
               "No captions, typography, watermark, logo, decorative orbit rings or placeholder graphics. "
               "Do not pretend this illustration is authentic documentary evidence. "
+              + ((CURIO_CANONICAL + f"Curio's scene-specific action: {curio_action}. Keep the topic as the visual star. ") if include_curio else "Do not include Curio or any mascot in this scene. ")
               + ("A scientific explanatory visual is appropriate; keep the physics accurate." if kind == "diagram" or (space_test and index >= 3)
                  else "Use a compelling concrete scene, not a chart, diagram or abstract engineering schematic."))
     return dict(image_prompt=prompt, visual_style=style, visual_kind=kind,
                 visual_summary=SPACE_SUMMARIES[index % len(SPACE_SUMMARIES)] if space_test else str(proposed.get("summary_ko") or narration),
                 requires_real=real, visual_reason=str(proposed.get("reason", "Educational scene illustration")),
-                visual_query=str(proposed.get("query") or title), asset_source=None)
+                visual_query=str(proposed.get("query") or title), asset_source=None,
+                include_curio=include_curio, curio_action=curio_action if include_curio else "")
 
 
 def acquire_scene(scene, path, index, settings, office_id, video_id, offline=False):

@@ -506,7 +506,8 @@ def run_stage(job):
             )
             for i, (start, end, narration) in enumerate(sentence_groups)
         ]
-        visuals = video["script"].get("visuals", [])
+        visuals = assets.curate_curio_appearances(video["script"].get("visuals", []))
+        video["script"]["visuals"] = visuals
         for i, (scene, (start, end, _)) in enumerate(zip(scenes, sentence_groups)):
             visual_index = i if len(visuals) == len(sentence_groups) else start
             proposed = visuals[visual_index] if visual_index < len(visuals) else None
