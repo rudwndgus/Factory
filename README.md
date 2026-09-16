@@ -47,6 +47,15 @@ powershell -ExecutionPolicy Bypass -File scripts/remote-fixed.ps1
 
 ## 구현된 흐름
 
+### 제작 큐와 대표 승인 예약
+
+- Ideas의 **Add to Queue**는 Office+topic당 활성 작업 한 개만 만듭니다. 같은 버튼을 여러 탭에서 눌러도 SQLite `active_topic_jobs` claim이 중복을 막습니다.
+- Production Queue에서 아직 시작하지 않은 `QUEUED/PLANNED` 항목은 **Remove from Queue**로 제거할 수 있습니다. 주제와 예약 슬롯이 풀리므로 나중에 다시 추가할 수 있습니다. 시작된 작업은 기록을 지우지 않고 **Cancel Production**으로 안전하게 중단합니다.
+- 일일 계획은 수동 큐를 먼저 배치한 뒤, 정규화된 broad category를 가중 비복원 추출합니다. 가능한 경우 09:00/15:00/21:00에 서로 다른 세 카테고리를 배치하고, 강한 후보 3~5개 안에서 점수 가중 선택합니다. 로컬 제목/키워드 유사도로 같은 날 의미가 겹치는 소재를 피하며 후보가 부족할 때만 이유를 기록하고 fallback합니다.
+- `Review Everything` 영상은 제작만 자동 완료되고 `READY FOR APPROVAL`에서 멈춥니다. Video Library의 **승인 후 업로드 예약**에서 제목·카테고리·길이·Office timezone의 최종 슬롯을 확인한 뒤 승인합니다.
+- 승인이 늦어 기존 슬롯이 지났으면 09:00/15:00/21:00 중 다음 빈 슬롯으로 이동하며 `original_slot`, `final_publish_at`, `reschedule_reason`을 남깁니다. YouTube에는 private+`publishAt`으로 전송됩니다.
+- `publish_slot_claims`, `approval_claims`, 기존 `upload_claims`가 각각 한 슬롯 한 영상, 한 승인 실행, 한 YouTube 업로드를 영구 보장합니다.
+
 ```text
 Next.js / Phaser office ── authenticated API + SSE ── FastAPI
                                                          │

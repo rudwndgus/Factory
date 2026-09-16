@@ -134,6 +134,72 @@ def _refresh_slot(office_id, slot):
         slot["failure_reason"] = job.get("error")
 
 
+def release_job(office_id, job_id):
+    """Release a pending plan slot without deleting production history."""
+    for row in db.rows("daily_production_plans", office_id):
+        plan = row["data"]
+        changed = False
+        for slot in plan.get("publish_slots", []):
+            if slot.get("job_id") == job_id and slot.get("status") not in ("SCHEDULED", "PUBLISHED"):
+                slot.update(
+                    topic_id=None, topic_title=None, category=None, category_family=None,
+                    video_id=None, job_id=None, status="PLANNED",
+                )
+                changed = True
+        if changed:
+            _save(office_id, plan)
+
+
+def _manual_jobs(office_id):
+    with db.connection() as connection:
+        rows = connection.execute(
+            "SELECT j.* FROM jobs j JOIN active_topic_jobs a ON a.job_id=j.id "
+            "WHERE j.office_id=? AND j.status IN ('QUEUED','PLANNED','RETRYING','WAITING') ORDER BY j.created,j.id",
+            (office_id,),
+        ).fetchall()
+    result = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if payload.get("manual_queue") and not payload.get("daily_plan_id"):
+            result.append((dict(row), payload))
+    return result
+
+
+def _assign_existing_job(office_id, plan, slot, job, payload, topic):
+    with db.connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT INTO publish_slot_claims VALUES(?,?,?,?,?)",
+            (office_id, slot["scheduled_publish_at"], job["id"], "PLANNED", time.time()),
+        )
+        payload.update(
+            scheduled_publish_at=slot["scheduled_publish_at"],
+            daily_plan_id=_id(office_id, plan["date"]),
+            slot_index=slot["index"],
+        )
+        connection.execute(
+            "UPDATE jobs SET payload=?,updated=? WHERE id=?",
+            (json.dumps(payload), time.time(), job["id"]),
+        )
+    video = _video(office_id, job["id"])
+    if video:
+        video.update(
+            scheduled_publish_at=slot["scheduled_publish_at"],
+            daily_plan_id=_id(office_id, plan["date"]),
+            plan_slot_index=slot["index"],
+        )
+        db.put("videos", office_id, video, job["id"], job["id"])
+    family = topics.normalize_category(topic.get("category", ""), topic.get("title", ""))
+    slot.update(
+        topic_id=payload.get("topic_id"), topic_title=topic.get("title"),
+        category=topic.get("category"), category_family=family,
+        video_id=job["id"], job_id=job["id"], status="QUEUED",
+        category_selection_reason="Owner-selected manual queue topic has priority",
+        topic_selection_reason="Selected manually by owner",
+        score_breakdown={},
+    )
+
+
 def _replaceable(slot):
     if slot.get("status") in TERMINAL_FAILURES:
         return True
@@ -179,6 +245,8 @@ def reconcile(office_id, plan=None, now=None, create_jobs=True):
         if not _budget_allows_replacement(office, now):
             slot["replacement_blocked"] = "Daily or monthly budget cannot fund a replacement"
             continue
+        with db.connection() as connection:
+            connection.execute("DELETE FROM publish_slot_claims WHERE video_id=?", (slot.get("job_id"),))
         slot["job_id"] = None
         slot["video_id"] = None
         slot["youtube_video_id"] = None
@@ -189,7 +257,27 @@ def reconcile(office_id, plan=None, now=None, create_jobs=True):
     need.extend(candidates_for_replacement)
 
     if create_jobs and need:
-        ranked = topics.ranked_candidates(office_id, assigned)
+        topics_by_id = {row["id"]: row["data"] for row in db.rows("topics", office_id)}
+        manual = _manual_jobs(office_id)
+        for slot, (job, payload) in zip(list(need), manual):
+            topic = topics_by_id.get(payload.get("topic_id"), {})
+            _assign_existing_job(office_id, plan, slot, job, payload, topic)
+            assigned.add(payload.get("topic_id"))
+            need.remove(slot)
+
+        with db.connection() as connection:
+            active_topic_ids = {
+                row["topic_id"] for row in connection.execute(
+                    "SELECT topic_id FROM active_topic_jobs WHERE office_id=?", (office_id,)
+                ).fetchall()
+            }
+        existing_topics = [
+            topics_by_id[slot["topic_id"]] for slot in plan["publish_slots"]
+            if slot.get("topic_id") in topics_by_id
+        ]
+        ranked = topics.diverse_candidates(
+            office_id, len(need), assigned | active_topic_ids, existing_topics
+        )
         if len(ranked) < len(need):
             try:
                 topics.discover(office_id)
@@ -197,7 +285,9 @@ def reconcile(office_id, plan=None, now=None, create_jobs=True):
                 warning = f"Discovery unavailable during reconciliation: {type(exc).__name__}"
                 if warning not in plan["warnings"]:
                     plan["warnings"].append(warning)
-            ranked = topics.ranked_candidates(office_id, assigned)
+            ranked = topics.diverse_candidates(
+                office_id, len(need), assigned | active_topic_ids, existing_topics
+            )
         for slot, topic in zip(need, ranked):
             topic_id = topic["id"]
             job_id = engine.enqueue(
@@ -207,6 +297,7 @@ def reconcile(office_id, plan=None, now=None, create_jobs=True):
                 plan_id=_id(office_id, plan["date"]),
                 slot_index=slot["index"],
                 replacement=slot.get("replacement_count", 0) > 0,
+                override_duplicate=True,
             )
             slot.update(
                 topic_id=topic_id,
@@ -217,17 +308,31 @@ def reconcile(office_id, plan=None, now=None, create_jobs=True):
                 video_id=job_id,
                 job_id=job_id,
                 status="PRODUCING",
+                category=topic.get("category"),
+                category_family=topic.get("category_family"),
+                category_selection_reason=topic.get("category_selection_reason"),
+                topic_selection_reason=topic.get("topic_selection_reason"),
             )
             assigned.add(topic_id)
+            existing_topics.append(topic)
+
+        families = {slot.get("category_family") for slot in plan["publish_slots"] if slot.get("category_family")}
+        assigned_count = sum(bool(slot.get("topic_id")) for slot in plan["publish_slots"])
+        if assigned_count >= 2 and len(families) < min(3, assigned_count):
+            warning = "Diversity fallback: not enough distinct qualified category families were available"
+            if warning not in plan["warnings"]:
+                plan["warnings"].append(warning)
 
     statuses = [slot["status"] for slot in plan["publish_slots"]]
     if statuses and all(s == "PUBLISHED" for s in statuses):
         plan["production_status"] = "PUBLISHED"
     elif any(s == "REVIEW_REQUIRED" for s in statuses):
         plan["production_status"] = "REVIEW_REQUIRED"
+    elif any(s == "READY_FOR_APPROVAL" for s in statuses):
+        plan["production_status"] = "READY_FOR_APPROVAL"
     elif any(s in TERMINAL_FAILURES for s in statuses):
         plan["production_status"] = "DEGRADED"
-    elif statuses and all(s in ("READY", "SCHEDULED", "PUBLISHED") for s in statuses):
+    elif statuses and all(s in ("READY", "READY_FOR_APPROVAL", "APPROVED", "SCHEDULED", "PUBLISHED") for s in statuses):
         plan["production_status"] = "READY"
     else:
         plan["production_status"] = "PRODUCING"
@@ -251,3 +356,99 @@ def update_video(office_id, video):
                     slot[key] = video[key]
             break
     reconcile(office_id, plan, create_jobs=False)
+
+
+def _future_configured_slots(office_id, now):
+    office = db.office(office_id)
+    settings = office["settings"]
+    zone = ZoneInfo(settings["timezone"])
+    local_now = datetime.fromtimestamp(now, zone)
+    for day_offset in range(22):
+        day = (local_now + timedelta(days=day_offset)).date()
+        for value in settings["upload_times"]:
+            hour, minute = map(int, value.split(":"))
+            local_slot = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
+            if local_slot.timestamp() > now + 15 * 60:
+                yield _utc_iso(local_slot)
+
+
+def schedule_preview(office_id, video_id, now=None):
+    now = now or time.time()
+    video = _video(office_id, video_id)
+    if not video:
+        raise ValueError("Video not found")
+    original = video.get("scheduled_publish_at")
+    with db.connection() as connection:
+        claims = {
+            row["publish_at"]: row["video_id"]
+            for row in connection.execute(
+                "SELECT publish_at,video_id FROM publish_slot_claims WHERE office_id=?",
+                (office_id,),
+            ).fetchall()
+        }
+    if original and _timestamp(original) > now + 15 * 60 and claims.get(original) in (None, video_id):
+        final = original
+        reason = None
+    else:
+        final = next(
+            candidate for candidate in _future_configured_slots(office_id, now)
+            if claims.get(candidate) in (None, video_id)
+        )
+        reason = (
+            "Assigned publish slot passed or is too close; moved to the next available configured slot"
+            if original else "No slot was assigned; selected the next available configured slot"
+        )
+    office = db.office(office_id)
+    return {
+        "original_slot": original,
+        "final_publish_at": final,
+        "reschedule_reason": reason,
+        "timezone": office["settings"]["timezone"],
+        "privacy": "private until YouTube publishAt",
+    }
+
+
+def claim_schedule(office_id, video_id, now=None):
+    """Atomically reserve exactly one final YouTube publishing slot per video."""
+    now = now or time.time()
+    with db.connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            "SELECT publish_at,status FROM publish_slot_claims WHERE office_id=? AND video_id=?",
+            (office_id, video_id),
+        ).fetchone()
+        video = _video(office_id, video_id)
+        original = video.get("scheduled_publish_at") if video else None
+        current_claims = {
+            row["publish_at"]: row["video_id"]
+            for row in connection.execute(
+                "SELECT publish_at,video_id FROM publish_slot_claims WHERE office_id=?",
+                (office_id,),
+            ).fetchall()
+        }
+        if original and _timestamp(original) > now + 15 * 60 and current_claims.get(original) in (None, video_id):
+            final, reason = original, None
+        else:
+            final = next(
+                candidate for candidate in _future_configured_slots(office_id, now)
+                if current_claims.get(candidate) in (None, video_id)
+            )
+            reason = (
+                "Assigned publish slot passed or is too close; moved to the next available configured slot"
+                if original else "No slot was assigned; selected the next available configured slot"
+            )
+        connection.execute(
+            "DELETE FROM publish_slot_claims WHERE office_id=? AND video_id=?",
+            (office_id, video_id),
+        )
+        connection.execute(
+            "INSERT INTO publish_slot_claims VALUES(?,?,?,?,?)",
+            (office_id, final, video_id, "APPROVED", time.time()),
+        )
+    return {
+        "original_slot": original,
+        "final_publish_at": final,
+        "reschedule_reason": reason,
+        "timezone": db.office(office_id)["settings"]["timezone"],
+        "privacy": "private until YouTube publishAt",
+    }

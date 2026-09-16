@@ -34,6 +34,8 @@ import {
   Globe,
   Power,
   Menu,
+  Trash2,
+  CalendarClock,
 } from "lucide-react";
 import {
   api,
@@ -140,6 +142,12 @@ export default function Page() {
   const videos = snap?.videos || emptyRows,
     jobs = snap?.jobs || [],
     reports = snap?.reports || emptyRows;
+  const productionQueue = snap?.production_queue || [];
+  const queuedTopics = new Map(
+    productionQueue
+      .filter((item: any) => item.topic_id)
+      .map((item: any) => [item.topic_id, item]),
+  );
   const ownerReports = reports.filter((r) =>
     ["production", "daily_summary", "weekly_summary"].includes(r.data.kind),
   );
@@ -302,9 +310,34 @@ export default function Page() {
     void act(
       () => api(root + `/videos/${v.id}/review`, "POST", { action }),
       action === "approve"
-        ? "승인했습니다. 예약 시각에 자동 업로드됩니다."
+        ? "검토 예외를 해제했습니다. 이제 Video Library에서 승인 후 예약할 수 있습니다."
         : "거부했습니다. 일일 목표에 필요하면 대체 영상이 계획됩니다.",
     );
+  }
+  async function openScheduleApproval(v: RecordRow) {
+    setSelected(v.id);
+    setError("");
+    try {
+      const preview = await api(root + `/videos/${v.id}/schedule-preview`);
+      setDetail({ ...v.data, approval_preview: preview });
+      setModal("approve-schedule");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  function videoStatus(value: string) {
+    const labels: Record<string, string> = {
+      PLANNED: "PRODUCING",
+      QUEUED: "PRODUCING",
+      READY: "APPROVED",
+      READY_FOR_APPROVAL: "READY FOR APPROVAL",
+      REVIEW_REQUIRED: "REVIEW REQUIRED",
+      UPLOAD_BLOCKED: "FAILED",
+      UPLOAD_FAILED: "FAILED",
+      WAITING_FREE: "WAITING FOR FREE QUOTA",
+      WAITING_FOR_FREE_QUOTA: "WAITING FOR FREE QUOTA",
+    };
+    return labels[value] || value?.replaceAll("_", " ") || "PRODUCING";
   }
   function openEmployee(role: string) {
     if (role === "CEO") {
@@ -850,9 +883,14 @@ export default function Page() {
                         <b>{slot.local_publish_time}</b>
                         <span className="pill">{slot.status}</span>
                         <p>{slot.topic_title || "주제 배정 중"}</p>
+                        {slot.category_family && <small>{slot.category_family}</small>}
                         <small>
                           게시 예약 {slot.scheduled_publish_at
-                            ? new Date(slot.scheduled_publish_at).toLocaleString()
+                            ? new Date(slot.scheduled_publish_at).toLocaleString([], {
+                                dateStyle: "medium",
+                                timeStyle: "short",
+                                timeZone: dailyPlan.timezone,
+                              })
                             : "대기"}
                         </small>
                       </article>
@@ -862,50 +900,54 @@ export default function Page() {
               )}
               <div className="section-head">
                 <h2>Production queue</h2>
-                <span>{jobs.length} jobs</span>
+                <span>{productionQueue.length} active jobs</span>
               </div>
-              {jobs.length ? (
-                jobs.map((j) => (
-                  <div className="job-row" key={j.id}>
+              {productionQueue.length ? (
+                productionQueue.map((item: any) => (
+                  <div className="job-row queue-card" key={item.job_id}>
                     <span className="job-icon">
-                      <Layers size={18} />
+                      <b>{item.position}</b>
                     </span>
                     <div>
-                      <h3>
-                        {videos.find((v) => v.id === j.id)?.data.title ||
-                          j.id.slice(0, 8)}
-                      </h3>
+                      <span className="eyebrow">{item.source} · {item.category_family}</span>
+                      <h3>{item.title}</h3>
                       <p>
-                        Stage {Math.min(j.stage + 1, 9)} / 9 · Attempts{" "}
-                        {j.attempts} {j.error ? "· " + j.error : ""}
+                        {item.planned_publish_at
+                          ? new Date(item.planned_publish_at).toLocaleString([], {
+                              dateStyle: "medium",
+                              timeStyle: "short",
+                            })
+                          : "Next available production slot"}
                       </p>
                     </div>
-                    <span className="pill">{j.status}</span>
-                    {["FAILED", "BLOCKED", "CANCELLED", "WAITING"].includes(
-                      j.status,
-                    ) ? (
+                    <span className="pill">{item.status}</span>
+                    {item.can_remove ? (
                       <button
-                        className="btn"
-                        onClick={() =>
+                        className="btn danger"
+                        disabled={busy}
+                        onClick={() => {
+                          if (!window.confirm("Remove this topic from the production queue?")) return;
                           void act(
-                            () => api(root + `/jobs/${j.id}/retry`, "POST"),
-                            "Retry queued",
-                          )
-                        }
+                            () => api(root + `/jobs/${item.job_id}/remove`, "POST"),
+                            "Queue item removed",
+                          );
+                        }}
                       >
-                        Retry stage
+                        <Trash2 size={14} /> Remove from Queue
                       </button>
-                    ) : j.status !== "COMPLETE" ? (
+                    ) : item.can_cancel ? (
                       <button
-                        className="btn"
-                        onClick={() =>
+                        className="btn danger"
+                        disabled={busy}
+                        onClick={() => {
+                          if (!window.confirm("Cancel this production safely? Completed files and history will be preserved.")) return;
                           void act(
-                            () => api(root + `/jobs/${j.id}/cancel`, "POST"),
-                            "Job cancelled",
-                          )
-                        }
+                            () => api(root + `/jobs/${item.job_id}/cancel`, "POST"),
+                            "Production cancelled",
+                          );
+                        }}
                       >
-                        Cancel
+                        Cancel Production
                       </button>
                     ) : null}
                   </div>
@@ -987,18 +1029,38 @@ export default function Page() {
                       >
                         Reject
                       </button>
-                      <button
-                        className="btn primary"
-                        onClick={() =>
-                          void act(
-                            () =>
-                              api(root + "/jobs", "POST", { topic_id: t.id }),
-                            "Production queued",
+                      {t.data.status === "rejected" ? (
+                        <span className="pill">Rejected</span>
+                      ) : t.data.status === "used" ? (
+                        <span className="pill">Used</span>
+                      ) : queuedTopics.has(t.id) ? (
+                        <span className="pill">
+                          {(["RUNNING", "RETRYING", "WAITING"] as string[]).includes(
+                            queuedTopics.get(t.id)?.status,
                           )
-                        }
-                      >
-                        Produce
-                      </button>
+                            ? "Producing"
+                            : "✓ Queued"}
+                        </span>
+                      ) : (
+                        <button
+                          className="btn primary"
+                          disabled={busy}
+                          onClick={() =>
+                            void act(async () => {
+                              const result = await api(root + "/jobs", "POST", {
+                                topic_id: t.id,
+                              });
+                              setNotice(
+                                result.result === "ALREADY_QUEUED"
+                                  ? "Already queued"
+                                  : "Added to production queue",
+                              );
+                            }, "Added to production queue")
+                          }
+                        >
+                          <Plus size={14} /> Add to Queue
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))
@@ -1038,7 +1100,7 @@ export default function Page() {
                       <button className="video-open" onClick={() => void openVideo(v)}>
                         <VideoThumbnail officeId={id} video={v} />
                         <h3>{v.data.title}</h3>
-                        <span className="pill">{v.data.status}</span>
+                        <span className="pill">{videoStatus(v.data.status)}</span>
                         <p>
                           {v.data.category || "분류 중"} · {v.data.format || "형식 결정 중"}
                         </p>
@@ -1049,28 +1111,37 @@ export default function Page() {
                           {date(v.created)}
                         </p>
                         {v.data.scheduled_publish_at && (
-                          <p>예약: {new Date(v.data.scheduled_publish_at).toLocaleString()}</p>
+                          <p className="schedule-line">
+                            <CalendarClock size={14} /> {v.data.status === "SCHEDULED" ? "Scheduled" : "Scheduled Slot"}: {new Date(v.data.scheduled_publish_at).toLocaleString([], {
+                              dateStyle: "medium",
+                              timeStyle: "short",
+                              timeZone: office?.settings.timezone || "UTC",
+                            })}
+                          </p>
                         )}
                         {v.data.youtube_video_id && <p>YouTube: {v.data.youtube_video_id}</p>}
                         {v.data.performance_score != null && (
                           <p>성과 점수: {v.data.performance_score}/100</p>
                         )}
                       </button>
-                      {!v.data.test_mode && v.data.status === "REVIEW_REQUIRED" && (
+                      {!v.data.test_mode && (
+                        v.data.status === "READY_FOR_APPROVAL" ||
+                        (v.data.status === "FAILED" && v.data.owner_approval && v.data.upload_failure && !v.data.youtube_video_id)
+                      ) && (
                         <div className="video-actions">
                           <button
                             className="btn primary"
                             disabled={busy}
-                            onClick={() => reviewVideo(v, "approve")}
+                            onClick={() => void openScheduleApproval(v)}
                           >
-                            <Check size={14} /> 승인
+                            <CalendarClock size={14} /> {v.data.status === "FAILED" ? "업로드 예약 재시도" : "승인 후 업로드 예약"}
                           </button>
-                          <button
-                            className="btn danger"
-                            disabled={busy}
-                            onClick={() => reviewVideo(v, "reject")}
-                          >
-                            <X size={14} /> 거부
+                        </div>
+                      )}
+                      {!v.data.test_mode && v.data.status === "REVIEW_REQUIRED" && (
+                        <div className="video-actions">
+                          <button className="btn danger" onClick={() => void openVideo(v)}>
+                            <AlertTriangle size={14} /> Review Required
                           </button>
                         </div>
                       )}
@@ -1822,12 +1893,19 @@ export default function Page() {
                           {label}
                         </button>
                       ))}
-                      {!detail.test_mode && ["READY", "APPROVED"].includes(detail.status) && (
+                      {!detail.test_mode && detail.status === "READY_FOR_APPROVAL" && (
                         <button
                           className="btn primary"
-                          onClick={() => setModal("publish")}
+                          onClick={() =>
+                            void api(root + `/videos/${selected}/schedule-preview`)
+                              .then((preview) => {
+                                setDetail({ ...detail, approval_preview: preview });
+                                setModal("approve-schedule");
+                              })
+                              .catch((e) => setError((e as Error).message))
+                          }
                         >
-                          Publish to YouTube
+                          <CalendarClock size={14} /> 승인 후 업로드 예약
                         </button>
                       )}
                     </div>
@@ -1870,42 +1948,46 @@ export default function Page() {
                   </button>
                 </form>
               </>
-            ) : modal === "publish" ? (
+            ) : modal === "approve-schedule" ? (
               <>
-                <h2>Publish approved video</h2>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    const f = new FormData(e.currentTarget);
-                    void act(async () => {
-                      await api(root + `/videos/${selected}/publish`, "POST", {
-                        privacy: f.get("privacy"),
-                        confirmed: true,
-                        publish_at: f.get("publish_at") || null,
-                      });
-                      setModal(null);
-                    }, "YouTube upload complete");
-                  }}
-                >
-                  <label>
-                    Visibility
-                    <select name="privacy">
-                      <option value="private">Private</option>
-                      <option value="unlisted">Unlisted</option>
-                      <option value="public">Public</option>
-                    </select>
-                  </label>
-                  <label>
-                    Schedule (optional, RFC3339)
-                    <input
-                      name="publish_at"
-                      placeholder="2026-10-01T12:00:00Z"
-                    />
-                  </label>
-                  <button className="btn primary full">
-                    Confirm YouTube upload
+                <span className="eyebrow">OWNER APPROVAL</span>
+                <h2>Approve this video?</h2>
+                <div className="approval-summary">
+                  <h3>{detail?.title}</h3>
+                  <p>{detail?.category || "Uncategorized"} · {detail?.actual_duration?.toFixed?.(1) || "—"} sec</p>
+                  <b>Publish</b>
+                  <p>
+                    {detail?.approval_preview?.final_publish_at
+                      ? new Date(detail.approval_preview.final_publish_at).toLocaleString([], {
+                          dateStyle: "long",
+                          timeStyle: "short",
+                          timeZone: detail.approval_preview.timezone,
+                        })
+                      : "Next available slot"}
+                  </p>
+                  <p>{detail?.approval_preview?.timezone}</p>
+                  <p>YouTube: private upload → scheduled public release</p>
+                  {detail?.approval_preview?.reschedule_reason && (
+                    <p className="warning-note">{detail.approval_preview.reschedule_reason}</p>
+                  )}
+                </div>
+                <div className="toolbar modal-actions">
+                  <button className="btn" onClick={() => setModal(null)}>Cancel</button>
+                  <button
+                    className="btn primary"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(async () => {
+                        await api(root + `/videos/${selected}/approve-schedule`, "POST", {
+                          confirmed: true,
+                        });
+                        setModal(null);
+                      }, "Owner approval saved and YouTube publishing scheduled")
+                    }
+                  >
+                    <Check size={14} /> Approve &amp; Schedule
                   </button>
-                </form>
+                </div>
               </>
             ) : null}
             {error && (

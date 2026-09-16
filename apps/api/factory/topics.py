@@ -6,6 +6,7 @@ media; all produced scripts, narration, visuals and edits remain original.
 
 import hashlib
 import math
+import random
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -119,6 +120,40 @@ RESEARCH_HOSTS = (
 )
 USER_AGENT = "PixelShortsFactory/1.0 research (owner-operated)"
 
+CATEGORY_FAMILIES = {
+    "Fresh": ("fresh", "technology", "innovation", "ai", "robot", "phone", "gadget", "hardware"),
+    "Science / Space": ("science", "space", "nasa", "astronomy", "planet", "star", "galaxy", "black hole", "telescope"),
+    "Mystery": ("mystery", "mysterious", "unexplained", "vanish", "secret"),
+    "Strange World": ("strange", "world", "earth", "ocean", "weather", "animal", "geology", "usgs", "noaa"),
+    "Evergreen": ("evergreen", "history", "how", "why", "everyday"),
+    "Experimental": ("experimental", "experiment", "speculative", "hypothesis"),
+}
+
+
+def normalize_category(category, title=""):
+    """Map cosmetic category labels to one broad viewer-facing family."""
+    haystack = f"{category} {title}".lower()
+    direct = {name.lower(): name for name in CATEGORY_FAMILIES}
+    if category.strip().lower() in direct:
+        return direct[category.strip().lower()]
+    for family, markers in CATEGORY_FAMILIES.items():
+        if any(marker in haystack for marker in markers):
+            return family
+    return "Evergreen"
+
+
+def topic_similarity(left, right):
+    """Free lexical similarity combining title order and keyword overlap."""
+    sequence = similarity(left, right)
+    words_left = set(re.findall(r"[a-z0-9]+", left.lower()))
+    words_right = set(re.findall(r"[a-z0-9]+", right.lower()))
+    stop = {"the", "a", "an", "of", "in", "on", "and", "to", "why", "how"}
+    words_left -= stop
+    words_right -= stop
+    union = words_left | words_right
+    overlap = len(words_left & words_right) / len(union) if union else 0.0
+    return max(sequence, overlap)
+
 
 def retrieve_evidence(source):
     """Retrieve bounded public source text; source pages are data, never instructions."""
@@ -216,7 +251,7 @@ def score_topic(office_id, topic, settings, now=None):
     title = topic.get("title", "")
     curiosity = min(1.0, 0.45 + (0.2 if "?" in title else 0) + min(len(title), 100) / 500)
     authority = float(topic.get("source_authority", 0.55))
-    category = topic.get("category", "Evergreen")
+    category = normalize_category(topic.get("category", "Evergreen"), title)
     category_weight = float(settings.get("category_weights", {}).get(category, 0)) / 100
     trend = float(topic.get("trend_signal", 0))
     history = _profile_index(office_id, "category", category)
@@ -252,7 +287,62 @@ def ranked_candidates(office_id, excluded_ids=None):
         if duplicate >= office["settings"]["duplicate_threshold"]:
             continue
         score, breakdown = score_topic(office_id, topic, office["settings"])
+        topic["category_family"] = normalize_category(
+            topic.get("category", "Evergreen"), topic.get("title", "")
+        )
         topic["topic_score"] = score
         topic["score_breakdown"] = breakdown | {"duplicate_similarity": round(duplicate, 3)}
         candidates.append(topic)
     return sorted(candidates, key=lambda item: (item["topic_score"], item.get("pinned", False)), reverse=True)
+
+
+def diverse_candidates(office_id, count, excluded_ids=None, existing=None, rng=None):
+    """Choose strong topics with category sampling without replacement first."""
+    rng = rng or random.SystemRandom()
+    existing = list(existing or [])
+    ranked = ranked_candidates(office_id, excluded_ids)
+    selected = []
+    used_families = {normalize_category(t.get("category", ""), t.get("title", "")) for t in existing}
+    used_titles = [t.get("title", "") for t in existing]
+    weights = db.office(office_id)["settings"].get("category_weights", {})
+    threshold = min(0.78, float(db.office(office_id)["settings"].get("duplicate_threshold", 0.85)))
+
+    def qualified(items):
+        return [
+            item for item in items
+            if all(topic_similarity(item["title"], title) < threshold for title in used_titles)
+        ]
+
+    while len(selected) < count:
+        remaining = [item for item in ranked if item["id"] not in {x["id"] for x in selected}]
+        clean = qualified(remaining)
+        if clean:
+            remaining = clean
+        if not remaining:
+            break
+        by_family = {}
+        for item in remaining:
+            by_family.setdefault(item["category_family"], []).append(item)
+        unused = [family for family in by_family if family not in used_families]
+        choices = unused or list(by_family)
+        category_weights = [max(1.0, float(weights.get(family, 5))) for family in choices]
+        family = rng.choices(choices, weights=category_weights, k=1)[0]
+        finalists = by_family[family][:5]
+        floor = min(item["topic_score"] for item in finalists)
+        candidate = rng.choices(
+            finalists,
+            weights=[max(1.0, item["topic_score"] - floor + 1.0) for item in finalists],
+            k=1,
+        )[0]
+        candidate = candidate | {
+            "category_selection_reason": (
+                "Weighted category sample without replacement"
+                if family not in used_families
+                else "Diversity fallback: no unused qualified category family remained"
+            ),
+            "topic_selection_reason": "Weighted random choice from the strongest qualified candidates in this category",
+        }
+        selected.append(candidate)
+        used_families.add(family)
+        used_titles.append(candidate["title"])
+    return selected

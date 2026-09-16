@@ -244,15 +244,24 @@ class OfficialYouTube:
         self.office_id = office_id
 
     @serialize_upload
-    def upload(self, video, path, privacy="private", publish_at=None):
+    def upload(
+        self,
+        video,
+        path,
+        privacy="private",
+        publish_at=None,
+        owner_initiated=False,
+    ):
         if video.get("test_mode"):
             raise ValueError("TEST RUN videos can never be published")
-        if db.office(self.office_id)["mode"] in (
+        office_mode = db.office(self.office_id)["mode"]
+        blocked_modes = ("EMERGENCY_STOP", "MAINTENANCE") if owner_initiated else (
             "EMERGENCY_STOP",
             "MAINTENANCE",
             "STOPPED",
             "PAUSED",
-        ):
+        )
+        if office_mode in blocked_modes:
             raise ValueError("Start Office before uploading")
         headers = {"Authorization": "Bearer " + access(self.office_id)}
         status = {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}
@@ -320,7 +329,10 @@ class OfficialYouTube:
                 },
                 video["id"],
             )
-            if db.office(self.office_id)["mode"] != "RUNNING":
+            if (
+                not owner_initiated
+                and db.office(self.office_id)["mode"] != "RUNNING"
+            ) or db.office(self.office_id)["mode"] in ("EMERGENCY_STOP", "MAINTENANCE"):
                 raise ValueError("Office stopped before upload")
             with path.open("rb") as f:
                 r = client.put(

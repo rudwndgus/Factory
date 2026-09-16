@@ -21,6 +21,7 @@ export type Snapshot = {
   office: Office;
   employees: Employee[];
   jobs: any[];
+  production_queue: any[];
   videos: RecordRow[];
   topics: RecordRow[];
   reports: RecordRow[];

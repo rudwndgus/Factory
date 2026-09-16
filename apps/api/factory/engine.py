@@ -18,6 +18,7 @@ from .providers import (
 from . import media, assets, topics, verification, planning
 
 LOCK = threading.Lock()
+ACTIVE_JOB_STATUSES = ("QUEUED", "PLANNED", "RUNNING", "RETRYING", "WAITING")
 ROLE_INDEX = [1, 2, 3, 4, 5, 6, 6, 7, 8]
 TEST_SCRIPT = {
     "title": "Why space is silent — TEST RUN",
@@ -43,6 +44,16 @@ TEST_SCRIPT = {
 }
 
 
+class AlreadyQueued(ValueError):
+    def __init__(self, job_id, message="ALREADY_QUEUED"):
+        super().__init__(message)
+        self.job_id = job_id
+
+
+class SimilarTopicQueued(ValueError):
+    pass
+
+
 def visual_scene_groups(sentences, max_images=5):
     """Keep narration intact while grouping it into a bounded number of visuals."""
     if not sentences:
@@ -65,14 +76,36 @@ def enqueue(
     plan_id=None,
     slot_index=None,
     replacement=False,
+    manual_queue=False,
+    override_duplicate=False,
 ):
     office = db.office(office_id)
     if not office:
         raise ValueError("Office not found")
-    if office["mode"] == "EMERGENCY_STOP" or (
-        (not test_mode or ai_visuals) and office["mode"] != "RUNNING"
+    if office["mode"] in ("EMERGENCY_STOP", "MAINTENANCE") or (
+        (not test_mode or ai_visuals) and office["mode"] != "RUNNING" and not manual_queue
     ):
         raise ValueError("Start the Office before queuing production")
+    topic = None
+    if topic_id and not test_mode:
+        topic_row = next((row for row in db.rows("topics", office_id) if row["id"] == topic_id), None)
+        if not topic_row or topic_row["data"].get("status") in ("used", "rejected"):
+            raise ValueError("Topic is not available for production")
+        topic = topic_row["data"]
+        if not override_duplicate:
+            with db.connection() as connection:
+                active_rows = connection.execute(
+                    "SELECT topic_id,job_id FROM active_topic_jobs WHERE office_id=?", (office_id,)
+                ).fetchall()
+            exact = next((row for row in active_rows if row["topic_id"] == topic_id), None)
+            if exact:
+                raise AlreadyQueued(exact["job_id"])
+            active_ids = {row["topic_id"] for row in active_rows}
+            for row in db.rows("topics", office_id):
+                if row["id"] in active_ids and topics.topic_similarity(
+                    topic.get("title", ""), row["data"].get("title", "")
+                ) >= office["settings"]["duplicate_threshold"]:
+                    raise SimilarTopicQueued("A very similar topic is already queued")
     id = db.uid()
     payload = dict(
         test_mode=test_mode,
@@ -83,8 +116,29 @@ def enqueue(
         daily_plan_id=plan_id,
         slot_index=slot_index,
         replacement=replacement,
+        manual_queue=manual_queue,
     )
     with db.connection() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if topic_id and not test_mode:
+            existing = c.execute(
+                "SELECT job_id FROM active_topic_jobs WHERE office_id=? AND topic_id=?",
+                (office_id, topic_id),
+            ).fetchone()
+            if existing:
+                raise AlreadyQueued(existing["job_id"])
+            c.execute(
+                "INSERT INTO active_topic_jobs VALUES(?,?,?,?,?)",
+                (office_id, topic_id, id, "QUEUED", time.time()),
+            )
+        if scheduled_publish_at and not test_mode:
+            try:
+                c.execute(
+                    "INSERT INTO publish_slot_claims VALUES(?,?,?,?,?)",
+                    (office_id, scheduled_publish_at, id, "PLANNED", time.time()),
+                )
+            except Exception:
+                raise ValueError("Publish slot is already assigned") from None
         c.execute(
             "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
@@ -106,7 +160,11 @@ def enqueue(
         office_id,
         {
             "id": id,
-            "title": "TEST RUN" if test_mode else "Queued production",
+            "title": "TEST RUN" if test_mode else (topic or {}).get("title", "Queued production"),
+            "category": (topic or {}).get("category"),
+            "category_family": topics.normalize_category(
+                (topic or {}).get("category", ""), (topic or {}).get("title", "")
+            ) if not test_mode else "Science / Space",
             "status": "PLANNED" if plan_id else "QUEUED",
             "test_mode": test_mode,
             "ai_visuals": ai_visuals,
@@ -114,6 +172,7 @@ def enqueue(
             "daily_plan_id": plan_id,
             "plan_slot_index": slot_index,
             "replacement": replacement,
+            "manual_queue": manual_queue,
         },
         id,
         id,
@@ -161,7 +220,98 @@ def retry(office_id, id):
             "UPDATE jobs SET status='QUEUED',attempts=0,next_run=0,error=NULL WHERE id=?",
             (id,),
         )
+        payload = json.loads(c.execute("SELECT payload FROM jobs WHERE id=?", (id,)).fetchone()[0])
+        if payload.get("topic_id") and not payload.get("test_mode"):
+            c.execute(
+                "INSERT INTO active_topic_jobs VALUES(?,?,?,?,?) ON CONFLICT(office_id,topic_id) DO UPDATE SET job_id=excluded.job_id,status=excluded.status,updated=excluded.updated",
+                (office_id, payload["topic_id"], id, "QUEUED", time.time()),
+            )
     db.event(office_id, "Retry queued at saved stage", video_id=id)
+
+
+def remove_from_queue(office_id, job_id):
+    """Remove only work that has not started and release topic/slot claims."""
+    with db.connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        job = connection.execute(
+            "SELECT * FROM jobs WHERE id=? AND office_id=?", (job_id, office_id)
+        ).fetchone()
+        if not job:
+            raise ValueError("Queue item not found")
+        if job["status"] != "QUEUED" or job["stage"] != 0:
+            raise ValueError("Production already started; use Cancel Production")
+        payload = json.loads(job["payload"])
+        connection.execute(
+            "UPDATE jobs SET status='CANCELLED',error=?,updated=? WHERE id=?",
+            ("Removed from queue by owner", time.time(), job_id),
+        )
+        connection.execute("DELETE FROM active_topic_jobs WHERE job_id=?", (job_id,))
+        connection.execute("DELETE FROM publish_slot_claims WHERE video_id=?", (job_id,))
+        row = connection.execute("SELECT payload FROM videos WHERE id=?", (job_id,)).fetchone()
+        if row:
+            video = json.loads(row["payload"])
+            video["status"] = "CANCELLED"
+            video["queue_removed_at"] = time.time()
+            connection.execute("UPDATE videos SET payload=? WHERE id=?", (json.dumps(video), job_id))
+        topic_id = payload.get("topic_id")
+        if topic_id:
+            topic_row = connection.execute("SELECT payload FROM topics WHERE id=?", (topic_id,)).fetchone()
+            if topic_row:
+                topic = json.loads(topic_row["payload"])
+                if topic.get("status") not in ("used", "rejected"):
+                    topic["status"] = "candidate"
+                    connection.execute("UPDATE topics SET payload=? WHERE id=?", (json.dumps(topic), topic_id))
+    planning.release_job(office_id, job_id)
+    db.event(office_id, "Owner removed a pending topic from the production queue", video_id=job_id)
+
+
+def cancel_production(office_id, job_id):
+    with db.connection() as connection:
+        row = connection.execute(
+            "SELECT status FROM jobs WHERE id=? AND office_id=?", (job_id, office_id)
+        ).fetchone()
+        if not row or row["status"] == "COMPLETE":
+            raise ValueError("Completed production cannot be cancelled")
+        connection.execute(
+            "UPDATE jobs SET status='CANCELLED',error=?,updated=? WHERE id=?",
+            ("Cancelled by owner", time.time(), job_id),
+        )
+        connection.execute("DELETE FROM active_topic_jobs WHERE job_id=?", (job_id,))
+        connection.execute("DELETE FROM publish_slot_claims WHERE video_id=?", (job_id,))
+    planning.release_job(office_id, job_id)
+    db.event(office_id, "Production cancelled by owner", "warning", job_id)
+
+
+def queue_items(office_id):
+    topics_by_id = {row["id"]: row["data"] for row in db.rows("topics", office_id)}
+    videos_by_id = {row["id"]: row["data"] for row in db.rows("videos", office_id)}
+    with db.connection() as connection:
+        jobs = connection.execute(
+            "SELECT * FROM jobs WHERE office_id=? AND status IN (?,?,?,?,?) ORDER BY created,id",
+            (office_id, *ACTIVE_JOB_STATUSES),
+        ).fetchall()
+    result = []
+    for position, job in enumerate(jobs, 1):
+        payload = json.loads(job["payload"])
+        topic = topics_by_id.get(payload.get("topic_id"), {})
+        video = videos_by_id.get(job["id"], {})
+        result.append({
+            "position": position,
+            "job_id": job["id"],
+            "topic_id": payload.get("topic_id"),
+            "title": topic.get("title") or video.get("title") or "Topic selection pending",
+            "category": topic.get("category") or video.get("category") or "Uncategorized",
+            "category_family": topics.normalize_category(
+                topic.get("category", ""), topic.get("title", "")
+            ),
+            "source": topic.get("provider") or "Owner",
+            "planned_publish_at": payload.get("scheduled_publish_at"),
+            "status": "PLANNED" if video.get("status") == "PLANNED" else job["status"],
+            "can_remove": job["status"] == "QUEUED" and job["stage"] == 0,
+            "can_cancel": job["status"] == "RUNNING" or job["stage"] > 0,
+            "manual_queue": bool(payload.get("manual_queue")),
+        })
+    return result
 
 
 def discover(office_id):
@@ -452,11 +602,12 @@ def run_stage(job):
                 )
             if not hard_safety:
                 video["review_reasons"].append("Hard QC or rights gate failed")
-            video["status"] = (
-                "REVIEW_REQUIRED"
-                if policy == "Review Everything" or exception
-                else "READY"
-            )
+            if exception:
+                video["status"] = "REVIEW_REQUIRED"
+            elif policy == "Review Everything":
+                video["status"] = "READY_FOR_APPROVAL"
+            else:
+                video["status"] = "READY"
         db.put(
             "qc_checks",
             office_id,
@@ -465,7 +616,7 @@ def run_stage(job):
         )
         db.event(
             office_id,
-            "Test MP4 ready" if test else "Video ready for CEO review",
+            "Test MP4 ready" if test else f"Video production complete: {video['status']}",
             video_id=id,
         )
     save()
@@ -531,6 +682,13 @@ def tick():
                         job["id"],
                     ),
                 )
+                if job["stage"] == 8:
+                    c.execute("DELETE FROM active_topic_jobs WHERE job_id=?", (job["id"],))
+                else:
+                    c.execute(
+                        "UPDATE active_topic_jobs SET status='QUEUED',updated=? WHERE job_id=?",
+                        (time.time(), job["id"]),
+                    )
             db.put(
                 "job_attempts",
                 job["office_id"],
@@ -577,6 +735,13 @@ def tick():
                         job["id"],
                     ),
                 )
+                if status in ("BLOCKED", "FAILED", "CANCELLED"):
+                    c.execute("DELETE FROM active_topic_jobs WHERE job_id=?", (job["id"],))
+                else:
+                    c.execute(
+                        "UPDATE active_topic_jobs SET status=?,updated=? WHERE job_id=?",
+                        (status, time.time(), job["id"]),
+                    )
             db.put(
                 "errors",
                 job["office_id"],

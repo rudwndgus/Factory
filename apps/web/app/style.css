@@ -1041,6 +1041,40 @@ footer a {
   font-size: 10px;
   margin-top: 8px;
 }
+
+.queue-card .job-icon b {
+  font-size: 1rem;
+}
+
+.schedule-line {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 650;
+}
+
+.approval-summary {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  background: #fbfcf8;
+}
+
+.approval-summary h3 {
+  margin: 0 0 0.4rem;
+}
+
+.approval-summary p {
+  margin: 0.35rem 0 0.9rem;
+}
+
+.warning-note {
+  color: #a9584f;
+}
+
+.modal-actions {
+  justify-content: flex-end;
+}
 .cards,
 .video-cards {
   display: grid;

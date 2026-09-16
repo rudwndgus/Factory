@@ -184,6 +184,7 @@ class JobInput(BaseModel):
     test_mode: bool = False
     ai_visuals: bool = False
     topic_id: str | None = None
+    override_duplicate: bool = False
 
 
 class ReviewInput(BaseModel):
@@ -196,6 +197,10 @@ class PublishInput(BaseModel):
     privacy: Literal["private", "unlisted", "public"] = "private"
     confirmed: bool = False
     publish_at: str | None = None
+
+
+class ApproveScheduleInput(BaseModel):
+    confirmed: bool = False
 
 
 class RegenerateInput(BaseModel):
@@ -333,6 +338,7 @@ def snapshot(id: str):
     return dict(
         office=office,
         jobs=jobs,
+        production_queue=engine.queue_items(id),
         employees=employees,
         youtube=dict(channel) if channel else None,
         **{
@@ -379,22 +385,28 @@ async def events(id: str, request: Request):
 @app.post("/api/offices/{id}/jobs", dependencies=[Depends(require_owner)])
 def queue(id: str, body: JobInput):
     exists(id)
-    return {"id": engine.enqueue(id, body.test_mode, body.topic_id, body.ai_visuals)}
+    try:
+        job_id = engine.enqueue(
+            id, body.test_mode, body.topic_id, body.ai_visuals,
+            manual_queue=not body.test_mode,
+            override_duplicate=body.override_duplicate,
+        )
+        return {"id": job_id, "result": "QUEUED"}
+    except engine.AlreadyQueued as exc:
+        return {"id": exc.job_id, "result": "ALREADY_QUEUED"}
 
 
 @app.post(
     "/api/offices/{id}/jobs/{job_id}/{action}", dependencies=[Depends(require_owner)]
 )
-def job_action(id: str, job_id: str, action: Literal["retry", "cancel"]):
+def job_action(id: str, job_id: str, action: Literal["retry", "cancel", "remove"]):
     exists(id)
     if action == "retry":
         engine.retry(id, job_id)
+    elif action == "remove":
+        engine.remove_from_queue(id, job_id)
     else:
-        with db.connection() as c:
-            c.execute(
-                "UPDATE jobs SET status='CANCELLED' WHERE id=? AND office_id=? AND status!='COMPLETE'",
-                (job_id, id),
-            )
+        engine.cancel_production(id, job_id)
     return {"ok": True}
 
 
@@ -543,7 +555,7 @@ def review(id: str, video_id: str, body: ReviewInput):
         v["qc"]["facts"] = True
         v.setdefault("fact_check", {})["manual_override"] = True
         v["manual_review"] = {"decision": "approved", "at": time.time()}
-        v["status"] = "READY"
+        v["status"] = "READY_FOR_APPROVAL"
     elif body.action == "reject":
         v["status"] = "REJECTED"
         v["manual_review"] = {"decision": "rejected", "at": time.time()}
@@ -556,6 +568,139 @@ def review(id: str, video_id: str, body: ReviewInput):
     planning.update_video(id, v)
     db.event(id, "CEO action: " + body.action, video_id=video_id)
     return v
+
+
+@app.get(
+    "/api/offices/{id}/videos/{video_id}/schedule-preview",
+    dependencies=[Depends(require_owner)],
+)
+def schedule_preview(id: str, video_id: str):
+    exists(id)
+    v = video(id, video_id)
+    retryable_failure = (
+        v.get("status") == "FAILED"
+        and bool(v.get("owner_approval"))
+        and bool(v.get("upload_failure"))
+        and not v.get("youtube_video_id")
+    )
+    if v.get("test_mode") or (
+        v.get("status") != "READY_FOR_APPROVAL" and not retryable_failure
+    ):
+        raise ValueError("Video is not ready for owner scheduling approval")
+    return planning.schedule_preview(id, video_id)
+
+
+@app.post(
+    "/api/offices/{id}/videos/{video_id}/approve-schedule",
+    dependencies=[Depends(require_owner)],
+)
+def approve_schedule(id: str, video_id: str, body: ApproveScheduleInput):
+    if not body.confirmed:
+        raise ValueError("Confirm approval and scheduling")
+    office = exists(id)
+    v = video(id, video_id)
+    if v.get("youtube_video_id") and v.get("status") in ("SCHEDULED", "PUBLISHED"):
+        return v | {"result": "ALREADY_SCHEDULED"}
+    retryable_failure = (
+        v.get("status") == "FAILED"
+        and bool(v.get("owner_approval"))
+        and bool(v.get("upload_failure"))
+        and not v.get("youtube_video_id")
+    )
+    if v.get("test_mode") or (
+        v.get("status") != "READY_FOR_APPROVAL" and not retryable_failure
+    ):
+        raise ValueError("Only a completed owner-review video can be approved and scheduled")
+    if not v.get("file") or not (MEDIA / v["file"]).is_file():
+        raise ValueError("Rendered production file is missing")
+    qc = v.get("qc") or {}
+    hard_qc = all(value for name, value in qc.items() if name != "facts")
+    if not hard_qc or not (v.get("facts_verified") or qc.get("facts")):
+        raise ValueError("Review Required: resolve factual, rights, or hard QC exceptions first")
+
+    now = time.time()
+    with db.connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        claim = connection.execute(
+            "SELECT status FROM approval_claims WHERE office_id=? AND video_id=?",
+            (id, video_id),
+        ).fetchone()
+        if claim and claim["status"] in ("in_progress", "complete"):
+            current = video(id, video_id)
+            if current.get("youtube_video_id"):
+                return current | {"result": "ALREADY_SCHEDULED"}
+            raise ValueError("Approval and scheduling is already in progress")
+        connection.execute(
+            "INSERT INTO approval_claims VALUES(?,?,?,?) ON CONFLICT(office_id,video_id) DO UPDATE SET status=excluded.status,updated=excluded.updated",
+            (id, video_id, "in_progress", now),
+        )
+
+    try:
+        schedule = planning.claim_schedule(id, video_id, now)
+    except Exception:
+        with db.connection() as connection:
+            connection.execute(
+                "UPDATE approval_claims SET status='failed',updated=? WHERE office_id=? AND video_id=?",
+                (time.time(), id, video_id),
+            )
+        raise
+    v.update(
+        status="APPROVED",
+        owner_approval={"decision": "approved_and_scheduled", "at": now},
+        original_slot=schedule["original_slot"],
+        final_publish_at=schedule["final_publish_at"],
+        scheduled_publish_at=schedule["final_publish_at"],
+        reschedule_reason=schedule["reschedule_reason"],
+        schedule_timezone=schedule["timezone"],
+        youtube_privacy="private",
+    )
+    db.put("videos", id, v, video_id, video_id)
+    planning.update_video(id, v)
+    v["status"] = "UPLOADING"
+    db.put("videos", id, v, video_id, video_id)
+    try:
+        result = youtube.OfficialYouTube(id).upload(
+            v,
+            MEDIA / v["file"],
+            "private",
+            schedule["final_publish_at"],
+            owner_initiated=True,
+        )
+    except Exception:
+        v["status"] = "FAILED"
+        v["upload_failure"] = "YouTube scheduling failed; retry after checking the connection"
+        db.put("videos", id, v, video_id, video_id)
+        with db.connection() as connection:
+            connection.execute(
+                "UPDATE approval_claims SET status='failed',updated=? WHERE office_id=? AND video_id=?",
+                (time.time(), id, video_id),
+            )
+            connection.execute(
+                "UPDATE publish_slot_claims SET status='FAILED',updated=? WHERE office_id=? AND video_id=?",
+                (time.time(), id, video_id),
+            )
+        raise
+    v.update(
+        status="SCHEDULED",
+        youtube_id=result["youtube_id"],
+        youtube_video_id=result["youtube_id"],
+        youtube_upload_at=result.get("uploaded_at"),
+        published_at=result.get("published_at"),
+    )
+    db.put("videos", id, v, video_id, video_id)
+    reports.mark_uploaded(id, video_id, result.get("uploaded_at"))
+    planning.update_video(id, v)
+    with db.connection() as connection:
+        connection.execute(
+            "UPDATE approval_claims SET status='complete',updated=? WHERE office_id=? AND video_id=?",
+            (time.time(), id, video_id),
+        )
+        connection.execute(
+            "UPDATE publish_slot_claims SET status='SCHEDULED',updated=? WHERE office_id=? AND video_id=?",
+            (time.time(), id, video_id),
+        )
+    db.event(id, "Owner approved video and YouTube scheduled publishing", video_id=video_id)
+    return v | {"result": "SCHEDULED"}
 
 
 @app.post(

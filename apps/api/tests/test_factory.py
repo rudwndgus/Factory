@@ -6,6 +6,8 @@ import pytest
 import httpx
 import logging
 import struct
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -16,6 +18,7 @@ from factory import (
     planning,
     reports,
     security,
+    topics,
     verification,
     youtube,
 )
@@ -25,6 +28,9 @@ from factory.main import app
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
+    from factory import main as main_module
+
+    main_module.attempts.clear()
     monkeypatch.setattr(db, "DB", tmp_path / "test.sqlite3")
     monkeypatch.setenv("MASTER_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("OWNER_PASSWORD", "test-owner-password-123456")
@@ -628,6 +634,30 @@ def seed_topics(office_id, count=5):
         )
 
 
+def seed_diverse_topics(office_id):
+    categories = [
+        ("Science / Space", "Why Saturn's rings are disappearing", "NASA"),
+        ("Science / Space", "A black hole bends distant light", "NASA"),
+        ("Mystery", "The mystery of stones that move alone", "USGS"),
+        ("Mystery", "Why an ancient signal vanished", "NOAA"),
+        ("Fresh", "A new robot learns to handle glass", "Ars Technica"),
+        ("Fresh", "Tiny AI hardware changes field science", "Ars Technica"),
+        ("Strange World", "The lake that suddenly turned pink", "NOAA"),
+        ("Strange World", "An animal that survives frozen winters", "NOAA"),
+        ("Evergreen", "Why metal feels colder than wood", "ScienceDaily"),
+        ("Evergreen", "How shadows reveal the time", "ScienceDaily"),
+        ("Experimental", "Could plants grow under red starlight", "ScienceDaily"),
+        ("Experimental", "A laboratory tests silent levitation", "ScienceDaily"),
+    ]
+    for index, (category, title, provider) in enumerate(categories):
+        db.put("topics", office_id, {
+            "title": title, "summary": "Qualified public-source evidence",
+            "source_url": f"https://science.nasa.gov/diverse-{index}",
+            "provider": provider, "status": "candidate", "category": category,
+            "source_authority": 0.95, "discovered_at": 1_800_000_000,
+        }, id=f"diverse-{index}")
+
+
 def test_daily_plan_is_persistent_unique_and_restart_safe():
     office_id = first()
     seed_topics(office_id)
@@ -647,6 +677,82 @@ def test_daily_plan_is_persistent_unique_and_restart_safe():
     assert [slot["job_id"] for slot in again["publish_slots"]] == [
         slot["job_id"] for slot in plan["publish_slots"]
     ]
+
+
+def test_add_to_queue_twice_creates_one_active_job():
+    office_id = first()
+    seed_topics(office_id, 1)
+    first_job = engine.enqueue(office_id, topic_id="topic-0", manual_queue=True)
+    with pytest.raises(engine.AlreadyQueued) as duplicate:
+        engine.enqueue(office_id, topic_id="topic-0", manual_queue=True)
+    assert duplicate.value.job_id == first_job
+    assert len(engine.queue_items(office_id)) == 1
+
+
+def test_concurrent_duplicate_enqueue_is_persistently_blocked():
+    office_id = first()
+    seed_topics(office_id, 1)
+
+    def add():
+        try:
+            return ("queued", engine.enqueue(office_id, topic_id="topic-0", manual_queue=True))
+        except engine.AlreadyQueued as exc:
+            return ("already", exc.job_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: add(), range(2)))
+    assert sorted(kind for kind, _ in results) == ["already", "queued"]
+    assert len({job_id for _, job_id in results}) == 1
+
+
+def test_pending_queue_item_can_be_removed_and_queued_again():
+    office_id = first()
+    seed_topics(office_id, 1)
+    first_job = engine.enqueue(office_id, topic_id="topic-0", manual_queue=True)
+    engine.remove_from_queue(office_id, first_job)
+    assert engine.queue_items(office_id) == []
+    second_job = engine.enqueue(office_id, topic_id="topic-0", manual_queue=True)
+    assert second_job != first_job
+    assert len(engine.queue_items(office_id)) == 1
+
+
+def test_running_job_cannot_be_destructively_removed():
+    office_id = first()
+    seed_topics(office_id, 1)
+    job_id = engine.enqueue(office_id, topic_id="topic-0", manual_queue=True)
+    with db.connection() as connection:
+        connection.execute("UPDATE jobs SET status='RUNNING' WHERE id=?", (job_id,))
+    with pytest.raises(ValueError, match="Cancel Production"):
+        engine.remove_from_queue(office_id, job_id)
+
+
+def test_daily_plan_uses_distinct_categories_and_semantic_topics():
+    office_id = first()
+    seed_diverse_topics(office_id)
+    engine.set_mode(office_id, "RUNNING")
+    plan = planning.ensure_plan(office_id, now=1_800_000_000)
+    slots = plan["publish_slots"]
+    assert len({slot["category_family"] for slot in slots}) == 3
+    assert len({slot["scheduled_publish_at"] for slot in slots}) == 3
+    for index, left in enumerate(slots):
+        for right in slots[index + 1:]:
+            assert topics.topic_similarity(left["topic_title"], right["topic_title"]) < 0.78
+    assert all(slot.get("category_selection_reason") for slot in slots)
+    assert all("score_breakdown" in slot for slot in slots)
+
+
+def test_manual_queue_category_constrains_automatic_plan():
+    office_id = first()
+    seed_diverse_topics(office_id)
+    manual_job = engine.enqueue(office_id, topic_id="diverse-0", manual_queue=True)
+    engine.set_mode(office_id, "RUNNING")
+    plan = planning.ensure_plan(office_id, now=1_800_000_000)
+    assert plan["publish_slots"][0]["job_id"] == manual_job
+    assert plan["publish_slots"][0]["category_family"] == "Science / Space"
+    assert all(
+        slot["category_family"] != "Science / Space"
+        for slot in plan["publish_slots"][1:]
+    )
 
 
 def test_failed_daily_slot_gets_bounded_replacement():
@@ -724,8 +830,120 @@ def test_video_card_approval_makes_video_ready_for_automatic_upload():
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "READY" and body["facts_verified"] is True
+    assert body["status"] == "READY_FOR_APPROVAL" and body["facts_verified"] is True
     assert body["fact_check"]["manual_override"] is True
+
+
+def test_approve_and_schedule_uses_slot_and_double_click_is_idempotent(monkeypatch, tmp_path):
+    from factory import main as main_module
+
+    office_id = first()
+    engine.set_mode(office_id, "RUNNING")
+    scheduled = next(planning._future_configured_slots(office_id, time.time()))
+    rendered = tmp_path / "ready.mp4"
+    rendered.write_bytes(b"real-render-placeholder")
+    monkeypatch.setattr(main_module, "MEDIA", tmp_path)
+    db.put("videos", office_id, {
+        "id": "approval-video", "title": "Approval video", "category": "Mystery",
+        "actual_duration": 35.0, "test_mode": False, "status": "READY_FOR_APPROVAL",
+        "facts_verified": True, "qc": {"audio": True, "rights": True, "facts": True},
+        "file": "ready.mp4", "scheduled_publish_at": scheduled,
+    }, "approval-video", "approval-video")
+    calls = []
+    monkeypatch.setattr(
+        youtube.OfficialYouTube, "upload",
+        lambda self, video, path, privacy, publish_at, owner_initiated=False: calls.append((privacy, publish_at))
+        or {"youtube_id": "scheduled-youtube-id", "uploaded_at": time.time()},
+    )
+    first_response = client().post(
+        f"/api/offices/{office_id}/videos/approval-video/approve-schedule",
+        json={"confirmed": True},
+    )
+    assert first_response.status_code == 200
+    assert first_response.json()["status"] == "SCHEDULED"
+    assert first_response.json()["scheduled_publish_at"] == scheduled
+    assert calls == [("private", scheduled)]
+    second_response = client().post(
+        f"/api/offices/{office_id}/videos/approval-video/approve-schedule",
+        json={"confirmed": True},
+    )
+    assert second_response.status_code == 200
+    assert second_response.json()["result"] == "ALREADY_SCHEDULED"
+    assert calls == [("private", scheduled)]
+
+
+def test_missed_publish_slot_moves_to_next_configured_slot(monkeypatch, tmp_path):
+    from factory import main as main_module
+
+    office_id = first()
+    engine.set_mode(office_id, "RUNNING")
+    rendered = tmp_path / "missed.mp4"
+    rendered.write_bytes(b"real-render-placeholder")
+    monkeypatch.setattr(main_module, "MEDIA", tmp_path)
+    past = "2020-01-01T09:00:00Z"
+    db.put("videos", office_id, {
+        "id": "missed-video", "title": "Missed slot", "category": "Fresh",
+        "actual_duration": 35.0, "test_mode": False, "status": "READY_FOR_APPROVAL",
+        "facts_verified": True, "qc": {"audio": True, "rights": True, "facts": True},
+        "file": "missed.mp4", "scheduled_publish_at": past,
+    }, "missed-video", "missed-video")
+    monkeypatch.setattr(
+        youtube.OfficialYouTube, "upload",
+        lambda self, video, path, privacy, publish_at, owner_initiated=False: {
+            "youtube_id": "rescheduled-id", "uploaded_at": time.time()
+        },
+    )
+    response = client().post(
+        f"/api/offices/{office_id}/videos/missed-video/approve-schedule",
+        json={"confirmed": True},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["original_slot"] == past
+    assert datetime.fromisoformat(body["final_publish_at"].replace("Z", "+00:00")).timestamp() > time.time()
+    assert body["reschedule_reason"]
+
+
+def test_concurrent_approve_clicks_create_one_youtube_upload(monkeypatch, tmp_path):
+    from factory import main as main_module
+
+    office_id = first()
+    engine.set_mode(office_id, "RUNNING")
+    rendered = tmp_path / "concurrent.mp4"
+    rendered.write_bytes(b"real-render-placeholder")
+    monkeypatch.setattr(main_module, "MEDIA", tmp_path)
+    scheduled = next(planning._future_configured_slots(office_id, time.time()))
+    db.put("videos", office_id, {
+        "id": "concurrent-approval", "title": "Concurrent approval",
+        "category": "Evergreen", "actual_duration": 35.0, "test_mode": False,
+        "status": "READY_FOR_APPROVAL", "facts_verified": True,
+        "qc": {"audio": True, "rights": True, "facts": True},
+        "file": "concurrent.mp4", "scheduled_publish_at": scheduled,
+    }, "concurrent-approval", "concurrent-approval")
+    calls = []
+
+    def upload(*args, **kwargs):
+        calls.append(1)
+        time.sleep(0.1)
+        return {"youtube_id": "one-upload-only", "uploaded_at": time.time()}
+
+    monkeypatch.setattr(youtube.OfficialYouTube, "upload", upload)
+
+    def approve():
+        try:
+            return main_module.approve_schedule(
+                office_id, "concurrent-approval",
+                main_module.ApproveScheduleInput(confirmed=True),
+            ).get("result")
+        except ValueError:
+            return "IN_PROGRESS"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: approve(), range(2)))
+    assert len(calls) == 1
+    assert "SCHEDULED" in results
+    uploads = db.rows("videos", office_id, "concurrent-approval")
+    assert uploads[0]["data"]["youtube_video_id"] == "one-upload-only"
 
 
 def test_ready_video_uses_persistent_publish_slot(monkeypatch):
@@ -765,6 +983,22 @@ def test_ready_video_uses_persistent_publish_slot(monkeypatch):
     assert calls == [("public", scheduled)]
     result = next(row["data"] for row in db.rows("videos", office_id) if row["id"] == "ready-video")
     assert result["status"] == "SCHEDULED"
+
+
+def test_owner_review_video_never_auto_uploads(monkeypatch):
+    office_id = first()
+    engine.set_mode(office_id, "RUNNING")
+    db.put("videos", office_id, {
+        "id": "owner-gated", "title": "Owner gated", "test_mode": False,
+        "status": "READY_FOR_APPROVAL", "facts_verified": True,
+        "qc": {"audio": True, "rights": True, "facts": True}, "file": "owner.mp4",
+    }, "owner-gated", "owner-gated")
+    calls = []
+    monkeypatch.setattr(youtube.OfficialYouTube, "upload", lambda *args, **kwargs: calls.append(1))
+    engine.publish_approved()
+    assert calls == []
+    saved = next(row["data"] for row in db.rows("videos", office_id) if row["id"] == "owner-gated")
+    assert saved["status"] == "READY_FOR_APPROVAL"
 
 
 def test_upload_claim_blocks_a_second_process():
