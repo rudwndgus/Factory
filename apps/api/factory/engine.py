@@ -418,7 +418,11 @@ def run_stage(job):
         checks = media.technical_qc(directory / "final.mp4")
         checks.update(
             subtitles=(directory / "captions.ass").exists(),
-            duration=25 <= video["actual_duration"] <= 60,
+            duration=(
+                settings["duration"] * 0.8
+                <= video["actual_duration"]
+                <= settings["duration"] * 1.5
+            ),
             rights=all(
                 r["data"]["rights"] == "CLEARED"
                 for r in db.rows("rights_records", office_id, id)

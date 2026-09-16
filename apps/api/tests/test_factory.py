@@ -776,6 +776,28 @@ def test_upload_claim_blocks_a_second_process():
     youtube.claim_upload(office_id, "claim-video")
 
 
+def test_writer_rejects_narration_far_below_target(monkeypatch):
+    from factory import providers
+
+    provider = providers.OllamaProvider(settings={"ollama_model": "qwen3:4b"})
+    short = {
+        "title": "Short",
+        "description": "Short",
+        "category": "Science / Space",
+        "format": "Explanation",
+        "hook_style": "Question",
+        "sentences": ["Only a few words here."] * 6,
+        "claims": [],
+        "visuals": [
+            {"prompt": "space", "summary_ko": "우주", "kind": "cinematic",
+             "requires_real": False, "reason": "context"}
+        ] * 4,
+    }
+    monkeypatch.setattr(provider, "structured", lambda *args, **kwargs: short)
+    with pytest.raises(ValueError, match="outside the target range"):
+        provider.script({"title": "Space", "evidence": []}, {"duration": 35})
+
+
 def test_analytics_creates_feedback_and_learning_profile():
     office_id = first()
     db.put(
@@ -893,7 +915,9 @@ def test_writer_uses_local_ollama_structured_output(monkeypatch):
     payload = {
         "title": "Local title", "description": "Local description",
         "category": "Science / Space", "format": "Explanation", "hook_style": "Question",
-        "sentences": ["One.", "Two.", "Three.", "Four.", "Five."],
+        "sentences": [
+            "Each carefully written sentence contains ten useful spoken words today."
+        ] * 7,
         "claims": [{"claim": "A", "source_url": "https://nasa.gov/a", "confidence": .9, "type": "fact"}],
         "visuals": [{"prompt": f"scene {i}", "summary_ko": f"장면 {i}", "kind": "cinematic",
                      "requires_real": False, "reason": "illustration"} for i in range(4)],
