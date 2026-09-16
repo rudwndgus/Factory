@@ -63,11 +63,51 @@ def google_json(response, operation, sensitive=(), log_response=False):
 UPLOAD_LOCK = threading.Lock()
 
 
+def claim_upload(office_id, video_id):
+    """Claim an upload across threads and server processes before any Google call."""
+    now = time.time()
+    with db.connection() as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO upload_claims VALUES(?,?,?,?)",
+            (office_id, video_id, "in_progress", now),
+        )
+        if cursor.rowcount:
+            return
+        claim = connection.execute(
+            "SELECT status,updated FROM upload_claims WHERE office_id=? AND video_id=?",
+            (office_id, video_id),
+        ).fetchone()
+        if claim["status"] == "complete" or (
+            claim["status"] == "in_progress" and now - claim["updated"] < 1800
+        ):
+            raise ValueError("This video upload is already in progress or complete")
+        connection.execute(
+            "UPDATE upload_claims SET status='in_progress',updated=? WHERE office_id=? AND video_id=?",
+            (now, office_id, video_id),
+        )
+
+
+def finish_upload_claim(office_id, video_id, status):
+    with db.connection() as connection:
+        connection.execute(
+            "UPDATE upload_claims SET status=?,updated=? WHERE office_id=? AND video_id=?",
+            (status, time.time(), office_id, video_id),
+        )
+
+
 def serialize_upload(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
         with UPLOAD_LOCK:
-            return fn(*args, **kwargs)
+            provider, video = args[0], args[1]
+            claim_upload(provider.office_id, video["id"])
+            try:
+                result = fn(*args, **kwargs)
+            except Exception:
+                finish_upload_claim(provider.office_id, video["id"], "needs_reconciliation")
+                raise
+            finish_upload_claim(provider.office_id, video["id"], "complete")
+            return result
 
     return wrapped
 
@@ -239,8 +279,12 @@ class OfficialYouTube:
                         "youtube_id": probe.json()["id"],
                         "privacy": privacy,
                         "uploaded_at": time.time(),
+                        "scheduled_publish_at": publish_at,
                     }
                     db.put("uploads", self.office_id, result, video["id"], entry["id"])
+                    db.put("usage_events", self.office_id,
+                           {"provider": "youtube", "type": "quota_request", "operation": "upload_reconcile",
+                            "request_count": 1, "monetary_usd": 0.0, "recorded_at": time.time()}, video["id"])
                     return result
                 raise ValueError(
                     "Previous upload requires manual reconciliation; a duplicate upload is blocked"
@@ -296,8 +340,24 @@ class OfficialYouTube:
                 "youtube_id": r.json()["id"],
                 "privacy": privacy,
                 "uploaded_at": time.time(),
+                "scheduled_publish_at": publish_at,
             }
+            verification = client.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                headers=headers,
+                params={"part": "id,status,snippet", "id": result["youtube_id"]},
+            )
+            if verification.status_code != 200 or not verification.json().get("items"):
+                raise ValueError("YouTube accepted upload bytes but video verification failed")
+            item = verification.json()["items"][0]
+            result["verified"] = item.get("id") == result["youtube_id"]
+            result["youtube_status"] = item.get("status", {})
+            if item.get("status", {}).get("privacyStatus") == "public":
+                result["published_at"] = time.time()
             db.put("uploads", self.office_id, result, video["id"], record)
+            db.put("usage_events", self.office_id,
+                   {"provider": "youtube", "type": "quota_request", "operation": "video_upload",
+                    "request_count": 3, "monetary_usd": 0.0, "recorded_at": time.time()}, video["id"])
             return result
 
     def analytics(self):
@@ -313,7 +373,7 @@ class OfficialYouTube:
             response = httpx.get(
                 "https://www.googleapis.com/youtube/v3/videos",
                 headers=headers,
-                params=dict(part="statistics", id=id),
+                params=dict(part="statistics,status,snippet", id=id),
                 timeout=30,
             )
             if response.status_code != 200:
@@ -322,6 +382,8 @@ class OfficialYouTube:
             if not items:
                 continue
             metrics = {k: int(v) for k, v in items[0]["statistics"].items()}
+            metrics["youtube_status"] = items[0].get("status", {})
+            metrics["youtube_published_at"] = items[0].get("snippet", {}).get("publishedAt")
             r = httpx.get(
                 "https://youtubeanalytics.googleapis.com/v2/reports",
                 headers=headers,
@@ -348,6 +410,16 @@ class OfficialYouTube:
                         )
                     )
                 )
-            db.put("analytics_snapshots", self.office_id, metrics, upload["video_id"])
-            result.append(metrics)
+            from . import analytics as analyst
+
+            analyzed = analyst.process_snapshot(
+                self.office_id,
+                upload["video_id"],
+                metrics,
+                upload["data"].get("uploaded_at") or upload["created"],
+            )
+            db.put("usage_events", self.office_id,
+                   {"provider": "youtube", "type": "quota_request", "operation": "analytics",
+                    "request_count": 2, "monetary_usd": 0.0, "recorded_at": time.time()}, upload["video_id"])
+            result.append(analyzed)
         return result

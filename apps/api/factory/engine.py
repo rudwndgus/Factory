@@ -6,14 +6,16 @@ from zoneinfo import ZoneInfo
 from . import database as db
 from .config import STAGES, ROLES, MEDIA
 from .providers import (
-    OpenAI,
+    llm_provider,
+    tts_provider,
     OfficialFeeds,
     Pexels,
     similarity,
     ConfigurationRequired,
     BudgetBlocked,
+    FreeQuotaWait,
 )
-from . import media, assets
+from . import media, assets, topics, verification, planning
 
 LOCK = threading.Lock()
 ROLE_INDEX = [1, 2, 3, 4, 5, 6, 6, 7, 8]
@@ -54,7 +56,16 @@ def visual_scene_groups(sentences, max_images=5):
     return groups
 
 
-def enqueue(office_id, test_mode=False, topic_id=None, ai_visuals=False):
+def enqueue(
+    office_id,
+    test_mode=False,
+    topic_id=None,
+    ai_visuals=False,
+    scheduled_publish_at=None,
+    plan_id=None,
+    slot_index=None,
+    replacement=False,
+):
     office = db.office(office_id)
     if not office:
         raise ValueError("Office not found")
@@ -63,7 +74,16 @@ def enqueue(office_id, test_mode=False, topic_id=None, ai_visuals=False):
     ):
         raise ValueError("Start the Office before queuing production")
     id = db.uid()
-    payload = dict(test_mode=test_mode, topic_id=topic_id, video_id=id, ai_visuals=ai_visuals)
+    payload = dict(
+        test_mode=test_mode,
+        topic_id=topic_id,
+        video_id=id,
+        ai_visuals=ai_visuals,
+        scheduled_publish_at=scheduled_publish_at,
+        daily_plan_id=plan_id,
+        slot_index=slot_index,
+        replacement=replacement,
+    )
     with db.connection() as c:
         c.execute(
             "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -87,9 +107,13 @@ def enqueue(office_id, test_mode=False, topic_id=None, ai_visuals=False):
         {
             "id": id,
             "title": "TEST RUN" if test_mode else "Queued production",
-            "status": "QUEUED",
+            "status": "PLANNED" if plan_id else "QUEUED",
             "test_mode": test_mode,
             "ai_visuals": ai_visuals,
+            "scheduled_publish_at": scheduled_publish_at,
+            "daily_plan_id": plan_id,
+            "plan_slot_index": slot_index,
+            "replacement": replacement,
         },
         id,
         id,
@@ -141,16 +165,7 @@ def retry(office_id, id):
 
 
 def discover(office_id):
-    found = OfficialFeeds().discover()
-    prior = db.rows("topics", office_id)
-    count = 0
-    for topic in found:
-        if any(similarity(topic["title"], p["data"]["title"]) > 0.85 for p in prior):
-            continue
-        db.put("topics", office_id, topic)
-        count += 1
-    db.event(office_id, f"Scout collected {count} new topics from RSS sources")
-    return count
+    return topics.discover(office_id)
 
 
 def run_stage(job):
@@ -182,6 +197,7 @@ def run_stage(job):
             raise StagePaused("Paused at scene checkpoint")
 
     if stage == 0:
+        video["status"] = "PRODUCING"
         if test:
             topic = {
                 "title": TEST_SCRIPT["title"],
@@ -189,13 +205,13 @@ def run_stage(job):
                 "source_url": "https://science.nasa.gov/",
             }
         else:
-            topics = db.rows("topics", office_id)
-            if not topics:
+            topic_rows = db.rows("topics", office_id)
+            if not topic_rows:
                 discover(office_id)
-                topics = db.rows("topics", office_id)
+                topic_rows = db.rows("topics", office_id)
             candidates = [
                 t
-                for t in topics
+                for t in topic_rows
                 if t["data"].get("status") not in ("rejected", "used")
                 and (not payload.get("topic_id") or t["id"] == payload["topic_id"])
             ]
@@ -205,6 +221,27 @@ def run_stage(job):
             chosen = candidates[0]
             topic = chosen["data"]
             video["topic_id"] = chosen["id"]
+            if payload.get("daily_plan_id"):
+                plan_row = next(
+                    (
+                        row
+                        for row in db.rows("daily_production_plans", office_id)
+                        if row["id"] == payload["daily_plan_id"]
+                    ),
+                    None,
+                )
+                if plan_row:
+                    slot = next(
+                        (
+                            item
+                            for item in plan_row["data"]["publish_slots"]
+                            if item["index"] == payload.get("slot_index")
+                        ),
+                        {},
+                    )
+                    video["topic_score"] = slot.get("topic_score")
+                    video["topic_score_breakdown"] = slot.get("score_breakdown", {})
+                    video["topic_selection_reason"] = slot.get("selection_reason", "")
             existing = [
                 v
                 for v in db.rows("videos", office_id)
@@ -220,28 +257,85 @@ def run_stage(job):
         video.update(topic=topic, title=topic["title"])
         db.put("topic_sources", office_id, topic, id)
     elif stage == 1:
-        video["sources"] = [video["topic"]]
+        if test:
+            sources = [video["topic"]]
+        else:
+            sources = [video["topic"]]
+            for row in db.rows("topics", office_id):
+                candidate = row["data"]
+                if candidate.get("source_url") == video["topic"].get("source_url"):
+                    continue
+                if similarity(candidate.get("title", ""), video["topic"]["title"]) >= 0.55:
+                    sources.append(candidate)
+            unique, seen = [], set()
+            for source in sources:
+                key = source.get("source_url")
+                if key and key not in seen:
+                    seen.add(key)
+                    unique.append(source)
+            sources = [topics.retrieve_evidence(source) for source in unique[:6]]
+        video["sources"] = sources
         video["facts_verified"] = test
-        # RSS excerpt is evidence, not independent fact verification. Publication remains blocked until owner checks.
+        if not test:
+            video["research_synthesis"] = llm_provider(
+                office_id, id, settings
+            ).research(video["topic"], sources)
         video["research_note"] = (
-            "Offline test fixture"
+            "Explicit test fixture"
             if test
-            else "Source excerpt collected; independent fact review required"
+            else f"Collected {len(sources)} source records; claim verification follows after script generation"
         )
     elif stage == 2:
         script = (
             dict(TEST_SCRIPT)
             if test
-            else OpenAI(office_id, id).script(video["topic"], settings)
+            else llm_provider(office_id, id, settings).script(
+                video["topic"] | {"sources": video.get("sources", [])}, settings
+            )
         )
         video.update(
             script=script,
             title=script["title"],
             description=script.get("description", ""),
+            category=script.get(
+                "category", video.get("topic", {}).get("category", "Evergreen")
+            ),
+            format=script.get("format", "Explanation"),
+            hook_style=script.get("hook_style", "Unknown"),
         )
         db.put("video_scripts", office_id, script, id)
-        for claim in script.get("claims", []):
-            db.put("research_claims", office_id, claim, id)
+        fact_check = (
+            {
+                "claims": [
+                    dict(
+                        claim,
+                        classification="VERIFIED",
+                        confidence=1.0,
+                        supporting_sources=video["sources"],
+                    )
+                    for claim in script.get("claims", [])
+                ],
+                "video_fact_confidence": 1.0,
+                "facts_verified": True,
+                "verification_status": "VERIFIED",
+                "requires_review": False,
+                "method": "explicit test fixture",
+            }
+            if test
+            else verification.verify_claims(
+                script.get("claims", []), video.get("sources", [])
+            )
+        )
+        video["fact_check"] = fact_check
+        video["facts_verified"] = fact_check["facts_verified"]
+        for index, claim in enumerate(fact_check["claims"]):
+            db.put(
+                "research_claims",
+                office_id,
+                claim,
+                id,
+                id=f"{id}-claim-{index}",
+            )
     elif stage == 3:
         sentence_groups = visual_scene_groups(
             video["script"]["sentences"], settings.get("max_images_per_short", 5)
@@ -309,7 +403,7 @@ def run_stage(job):
                 if test:
                     media.local_voice(scene["narration"], path)
                 else:
-                    OpenAI(office_id, id).speak(scene["narration"], path)
+                    tts_provider(office_id, id, settings).speak(scene["narration"], path)
             scene["duration"] = media.duration(path)
             db.put("video_scenes", office_id, scene, id, id=f"{id}-{i}")
         video["actual_duration"] = sum(s["duration"] for s in video["scenes"])
@@ -320,6 +414,7 @@ def run_stage(job):
         video["file"] = str((directory / "final.mp4").relative_to(MEDIA))
         video["preview"] = str((directory / "preview.jpg").relative_to(MEDIA))
     elif stage == 8:
+        video["status"] = "QC"
         checks = media.technical_qc(directory / "final.mp4")
         checks.update(
             subtitles=(directory / "captions.ass").exists(),
@@ -333,7 +428,31 @@ def run_stage(job):
             not_test=not test,
         )
         video["qc"] = checks
-        video["status"] = "TEST_COMPLETE" if test else "WAITING_FOR_REVIEW"
+        if test:
+            video["status"] = "TEST_COMPLETE"
+        else:
+            hard_safety = all(
+                value for name, value in checks.items() if name != "facts"
+            )
+            exception = (
+                not video.get("facts_verified")
+                or not hard_safety
+                or bool(video.get("fact_check", {}).get("requires_review"))
+            )
+            policy = settings.get("review_policy", "Review Exceptions Only")
+            video["review_policy"] = policy
+            video["review_reasons"] = []
+            if not video.get("facts_verified"):
+                video["review_reasons"].append(
+                    "Factual evidence is uncertain or unsupported"
+                )
+            if not hard_safety:
+                video["review_reasons"].append("Hard QC or rights gate failed")
+            video["status"] = (
+                "REVIEW_REQUIRED"
+                if policy == "Review Everything" or exception
+                else "READY"
+            )
         db.put(
             "qc_checks",
             office_id,
@@ -346,6 +465,8 @@ def run_stage(job):
             video_id=id,
         )
     save()
+    if not test:
+        planning.update_video(office_id, video)
     from .reports import stage_report
     stage_report(office_id, id, stage, video)
 
@@ -418,15 +539,18 @@ def tick():
                 video_id=job["id"],
             )
         except Exception as exc:
-            blocked = isinstance(exc, (ConfigurationRequired, BudgetBlocked))
+            quota_wait = isinstance(exc, FreeQuotaWait)
+            blocked = isinstance(exc, (ConfigurationRequired, BudgetBlocked)) and not quota_wait
             cancelled = isinstance(exc, InterruptedError)
             attempts = job["attempts"] + 1
-            status = "WAITING" if isinstance(exc, StagePaused) else (
+            status = "WAITING" if isinstance(exc, (StagePaused, FreeQuotaWait)) else (
                 "CANCELLED"
                 if cancelled
                 else "BLOCKED" if blocked else "RETRYING" if attempts < 3 else "FAILED"
             )
             if isinstance(exc, StagePaused):
+                attempts = 0
+            if quota_wait:
                 attempts = 0
             # Do not persist external exception text; it may contain credentials, URLs, or response bodies.
             message = (
@@ -443,7 +567,7 @@ def tick():
                     (
                         status,
                         attempts,
-                        time.time() + 2**attempts * 5,
+                        time.time() + (3600 if quota_wait else 2**attempts * 5),
                         message,
                         time.time(),
                         job["id"],
@@ -462,6 +586,34 @@ def tick():
                 job["id"],
             )
             db.event(job["office_id"], message, "error", job["id"])
+            if status in ("FAILED", "BLOCKED", "CANCELLED"):
+                video_row = next(
+                    (
+                        item
+                        for item in db.rows("videos", job["office_id"])
+                        if item["id"] == job["id"]
+                    ),
+                    None,
+                )
+                if video_row:
+                    failed_video = video_row["data"]
+                    failed_video["status"] = status
+                    db.put(
+                        "videos",
+                        job["office_id"],
+                        failed_video,
+                        job["id"],
+                        job["id"],
+                    )
+                    planning.update_video(job["office_id"], failed_video)
+            elif quota_wait:
+                video_row = next((item for item in db.rows("videos", job["office_id"])
+                                  if item["id"] == job["id"]), None)
+                if video_row:
+                    waiting_video = video_row["data"]
+                    waiting_video["status"] = "WAITING_FOR_FREE_QUOTA"
+                    waiting_video["retry_after"] = time.time() + 3600
+                    db.put("videos", job["office_id"], waiting_video, job["id"], job["id"])
             from .reports import add_exception
             add_exception(job["office_id"], job["id"], role, message)
         finally:
@@ -478,38 +630,14 @@ def schedule():
     for office in db.offices():
         if office["mode"] != "RUNNING":
             continue
-        settings = office["settings"]
-        now = datetime.now(ZoneInfo(settings["timezone"]))
-        date = now.strftime("%Y-%m-%d")
-        with db.connection() as c:
-            today = [
-                json.loads(r[0])
-                for r in c.execute(
-                    "SELECT payload FROM jobs WHERE office_id=? AND created>=?",
-                    (
-                        office["id"],
-                        now.replace(
-                            hour=0, minute=0, second=0, microsecond=0
-                        ).timestamp(),
-                    ),
-                )
-                if not json.loads(r[0]).get("test_mode")
-            ]
-        if len(today) >= settings["videos_per_day"]:
-            continue
-        if now.strftime("%H:%M") not in settings["upload_times"]:
-            continue
-        key = date + " " + now.strftime("%H:%M")
-        if any(
-            r["data"].get("slot") == key for r in db.rows("system_events", office["id"])
-        ):
-            continue
-        enqueue(office["id"])
-        db.put(
-            "system_events",
-            office["id"],
-            dict(message="Scheduled production", slot=key, severity="info"),
-        )
+        try:
+            planning.ensure_plan(office["id"])
+        except Exception as exc:
+            db.event(
+                office["id"],
+                f"Daily planning deferred: {type(exc).__name__}",
+                "warning",
+            )
 
 
 def recover():
@@ -526,22 +654,43 @@ def publish_approved():
             continue
         for entry in db.rows("videos", office["id"]):
             v = entry["data"]
-            if v.get("test_mode") or not v.get("qc") or not all(v["qc"].values()):
+            if v.get("test_mode") or not v.get("qc"):
                 continue
-            if v["status"] not in ("APPROVED", "WAITING_FOR_REVIEW"):
+            hard_qc = all(
+                value for name, value in v["qc"].items() if name != "facts"
+            )
+            if not hard_qc or not (v.get("facts_verified") or v["qc"].get("facts")):
                 continue
-            if office["settings"]["review_mode"] and v["status"] != "APPROVED":
+            if v["status"] != "READY":
                 continue
             try:
-                result = OfficialYouTube(office["id"]).upload(
-                    v, MEDIA / v["file"], office["settings"]["privacy"]
+                publish_at = (
+                    v.get("scheduled_publish_at")
+                    if office["settings"]["privacy"] == "public"
+                    else None
                 )
-                v["status"] = "PUBLISHED"
+                result = OfficialYouTube(office["id"]).upload(
+                    v,
+                    MEDIA / v["file"],
+                    office["settings"]["privacy"],
+                    publish_at,
+                )
+                v["status"] = (
+                    "SCHEDULED" if publish_at else "PUBLISHED"
+                )
                 v["youtube_id"] = result["youtube_id"]
+                v["youtube_video_id"] = result["youtube_id"]
+                v["youtube_upload_at"] = result.get("uploaded_at")
+                v["published_at"] = result.get("published_at")
                 db.put("videos", office["id"], v, v["id"], v["id"])
                 from .reports import mark_uploaded
                 mark_uploaded(office["id"], v["id"], result.get("uploaded_at"))
-                db.event(office["id"], "Approved video uploaded", video_id=v["id"])
+                planning.update_video(office["id"], v)
+                db.event(
+                    office["id"],
+                    "Ready video uploaded to its YouTube schedule",
+                    video_id=v["id"],
+                )
             except Exception:
                 v["status"] = "UPLOAD_BLOCKED"
                 db.put("videos", office["id"], v, v["id"], v["id"])
@@ -551,6 +700,7 @@ def publish_approved():
                     "error",
                     v["id"],
                 )
+                planning.update_video(office["id"], v)
 
 
 def collect_analytics():

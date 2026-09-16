@@ -1,6 +1,6 @@
 """Owner overrides invalidate dependent artifacts and resume at the correct stage."""
 
-from . import database as db, engine
+from . import database as db, engine, planning
 from .config import MEDIA
 
 
@@ -64,6 +64,7 @@ def restart(office_id, video_id, stage, scene=None, sentences=None, replacement=
             v.pop(key, None)
         v["status"] = "QUEUED"
         db.put("videos", office_id, v, video_id, video_id)
+        planning.update_video(office_id, v)
         with db.connection() as c:
             c.execute(
                 "UPDATE jobs SET stage=?,status='QUEUED',attempts=0,next_run=0,error=NULL WHERE id=? AND office_id=?",

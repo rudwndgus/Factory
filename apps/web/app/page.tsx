@@ -39,6 +39,7 @@ import {
   api,
   config,
   fileUrl,
+  previewUrl,
   roles,
   type Snapshot,
   type Office,
@@ -128,6 +129,7 @@ export default function Page() {
     [hq, setHq] = useState(false),
     [reportShelf, setReportShelf] = useState<"inbox" | "archive">("inbox");
   const [imageProviderTest, setImageProviderTest] = useState<any>(null);
+  const [zeroCostStatus, setZeroCostStatus] = useState<any>(null);
   const [showTestVideos, setShowTestVideos] = useState(false);
   const [server, setServer] = useState("http://localhost:8000"),
     [password, setPassword] = useState("");
@@ -138,9 +140,11 @@ export default function Page() {
   const videos = snap?.videos || emptyRows,
     jobs = snap?.jobs || [],
     reports = snap?.reports || emptyRows;
-  const productionReports = reports.filter((r) => r.data.kind === "production");
-  const inboxReports = productionReports.filter((r) => !r.data.archived);
-  const archivedReports = productionReports.filter((r) => r.data.archived);
+  const ownerReports = reports.filter((r) =>
+    ["production", "daily_summary", "weekly_summary"].includes(r.data.kind),
+  );
+  const inboxReports = ownerReports.filter((r) => !r.data.archived);
+  const archivedReports = ownerReports.filter((r) => r.data.archived);
   const visibleReports =
     reportShelf === "inbox" ? inboxReports : archivedReports;
   const teamWorking = mode === "RUNNING";
@@ -150,11 +154,14 @@ export default function Page() {
   const productionVideos = videos.filter((video) => !video.data.test_mode);
   const testVideos = videos.filter((video) => video.data.test_mode);
   const visibleVideos = showTestVideos ? testVideos : productionVideos;
+  const dailyPlan = snap?.daily_production_plans?.[0]?.data;
   const today = new Date().toISOString().slice(0, 10);
   const costs = snap?.cost_events || [];
-  const dailyCost = costs
-    .filter((c) => c.data.day === today)
-    .reduce((s, c) => s + c.data.estimated_usd, 0);
+  const dailyCost = office?.settings.zero_cost_mode
+    ? 0
+    : costs
+        .filter((c) => c.data.day === today)
+        .reduce((s, c) => s + c.data.estimated_usd, 0);
   const produced = videos.filter(
     (v) =>
       v.data.file && new Date(v.created * 1000).toISOString().startsWith(today),
@@ -208,8 +215,12 @@ export default function Page() {
       api("/api/integrations")
         .then(setIntegrations)
         .catch(() => {});
+      if (id)
+        api(`/api/system/zero-cost-status?office_id=${id}`)
+          .then(setZeroCostStatus)
+          .catch(() => setZeroCostStatus(null));
     }
-  }, [connected, tab]);
+  }, [connected, tab, id]);
   useEffect(() => {
     if (!id) return;
     setSnap(null);
@@ -286,6 +297,14 @@ export default function Page() {
     } catch (e) {
       setError((e as Error).message);
     }
+  }
+  function reviewVideo(v: RecordRow, action: "approve" | "reject") {
+    void act(
+      () => api(root + `/videos/${v.id}/review`, "POST", { action }),
+      action === "approve"
+        ? "승인했습니다. 예약 시각에 자동 업로드됩니다."
+        : "거부했습니다. 일일 목표에 필요하면 대체 영상이 계획됩니다.",
+    );
   }
   function openEmployee(role: string) {
     if (role === "CEO") {
@@ -387,19 +406,19 @@ export default function Page() {
           <div className="budget-card">
             <div>
               <Coins size={14} />
-              <span>DAILY BUDGET</span>
+              <span>ZERO-COST MODE</span>
               <span>{connected ? dollars(dailyCost) : "—"}</span>
             </div>
             <div className="budget-track">
               <i
                 style={{
-                  width: `${Math.min(100, (dailyCost / (office?.settings.daily_budget || 3)) * 100)}%`,
+                  width: "0%",
                 }}
               />
             </div>
             <p>
               {connected
-                ? `${dollars(office?.settings.daily_budget || 0)} limit · estimated reservations`
+                ? "Paid providers blocked · free/local usage only"
                 : "Connect your server to track costs"}
             </p>
           </div>
@@ -495,7 +514,7 @@ export default function Page() {
                   void act(() => {
                     if (
                       !window.confirm(
-                        `${office?.settings.image_provider || "cloudflare"} 공급자로 AI 이미지 최대 ${office?.settings.max_images_per_short || 5}장을 생성하는 고정 주제 테스트입니다. Fallback은 ${office?.settings.image_fallback_provider || "none"}이며, OpenAI로 설정하면 Cloudflare 실패 시 OpenAI 비용이 발생할 수 있습니다. 새 TEST 영상이 하나 저장되며 업로드하지 않습니다. 진행할까요?`,
+                        `${office?.settings.image_provider || "cloudflare"} 무료 할당량으로 AI 이미지 최대 ${office?.settings.max_images_per_short || 5}장을 생성하는 고정 주제 테스트입니다. 유료 fallback은 차단됩니다. 새 TEST 영상이 하나 저장되며 업로드하지 않습니다. 진행할까요?`,
                       )
                     )
                       return Promise.resolve();
@@ -814,6 +833,33 @@ export default function Page() {
             </>
           ) : tab === "Production" ? (
             <section className="panel list-panel">
+              {dailyPlan && (
+                <div className="daily-plan">
+                  <div>
+                    <span className="eyebrow">DAILY PRODUCTION PLAN</span>
+                    <h3>
+                      {dailyPlan.date} · 목표 {dailyPlan.target_video_count}편
+                    </h3>
+                    <p>
+                      {dailyPlan.timezone} · {dailyPlan.production_status} · 대체 작업 {dailyPlan.replacement_jobs || 0}건
+                    </p>
+                  </div>
+                  <div className="plan-slots">
+                    {dailyPlan.publish_slots?.map((slot: any) => (
+                      <article key={slot.index}>
+                        <b>{slot.local_publish_time}</b>
+                        <span className="pill">{slot.status}</span>
+                        <p>{slot.topic_title || "주제 배정 중"}</p>
+                        <small>
+                          게시 예약 {slot.scheduled_publish_at
+                            ? new Date(slot.scheduled_publish_at).toLocaleString()
+                            : "대기"}
+                        </small>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="section-head">
                 <h2>Production queue</h2>
                 <span>{jobs.length} jobs</span>
@@ -985,26 +1031,50 @@ export default function Page() {
               {visibleVideos.length ? (
                 <div className="video-cards">
                   {visibleVideos.map((v) => (
-                    <button
+                    <article
                       key={v.id}
                       className="video-card"
-                      onClick={() => void openVideo(v)}
                     >
-                      <div className="video-cover">
-                        <Film size={38} />
-                        <span>
-                          {v.data.test_mode ? "TEST RUN" : "PRODUCTION"}
-                        </span>
-                      </div>
-                      <h3>{v.data.title}</h3>
-                      <span className="pill">{v.data.status}</span>
-                      <p>
-                        {v.data.actual_duration
-                          ? `${v.data.actual_duration.toFixed(1)} sec · `
-                          : ""}
-                        {date(v.created)}
-                      </p>
-                    </button>
+                      <button className="video-open" onClick={() => void openVideo(v)}>
+                        <VideoThumbnail officeId={id} video={v} />
+                        <h3>{v.data.title}</h3>
+                        <span className="pill">{v.data.status}</span>
+                        <p>
+                          {v.data.category || "분류 중"} · {v.data.format || "형식 결정 중"}
+                        </p>
+                        <p>
+                          {v.data.actual_duration
+                            ? `${v.data.actual_duration.toFixed(1)} sec · `
+                            : ""}
+                          {date(v.created)}
+                        </p>
+                        {v.data.scheduled_publish_at && (
+                          <p>예약: {new Date(v.data.scheduled_publish_at).toLocaleString()}</p>
+                        )}
+                        {v.data.youtube_video_id && <p>YouTube: {v.data.youtube_video_id}</p>}
+                        {v.data.performance_score != null && (
+                          <p>성과 점수: {v.data.performance_score}/100</p>
+                        )}
+                      </button>
+                      {!v.data.test_mode && v.data.status === "REVIEW_REQUIRED" && (
+                        <div className="video-actions">
+                          <button
+                            className="btn primary"
+                            disabled={busy}
+                            onClick={() => reviewVideo(v, "approve")}
+                          >
+                            <Check size={14} /> 승인
+                          </button>
+                          <button
+                            className="btn danger"
+                            disabled={busy}
+                            onClick={() => reviewVideo(v, "reject")}
+                          >
+                            <X size={14} /> 거부
+                          </button>
+                        </div>
+                      )}
+                    </article>
                   ))}
                 </div>
               ) : (
@@ -1061,9 +1131,13 @@ export default function Page() {
                       <h3>
                         {r.data.title || `${r.data.kind.toUpperCase()} REPORT`}
                       </h3>
-                      <p>{r.data.topic || r.data.summary}</p>
                       <p>
-                        {r.data.upload_date || "업로드 대기"} · {r.data.status}
+                        {r.data.topic ||
+                          r.data.topics?.join(" · ") ||
+                          (r.data.kind === "weekly_summary" ? "채널 성과와 다음 실험" : r.data.summary)}
+                      </p>
+                      <p>
+                        {r.data.upload_date || r.data.date || r.data.week || "업로드 대기"} · {r.data.status || "CEO 요약"}
                       </p>
                       <div />
                       <div />
@@ -1105,7 +1179,7 @@ export default function Page() {
               </div>
               {snap?.analytics_snapshots.length ? (
                 snap.analytics_snapshots.map((a) => (
-                  <div className="job-row" key={a.id}>
+                  <div className="analytics-card" key={a.id}>
                     <div>
                       <h3>
                         {videos.find((v) => v.id === a.video_id)?.data.title ||
@@ -1113,7 +1187,20 @@ export default function Page() {
                       </h3>
                       <p>{date(a.created)}</p>
                     </div>
-                    <pre>{JSON.stringify(a.data, null, 2)}</pre>
+                    <span className="performance-score">
+                      {a.data.performance_score ?? "—"}<small>/100</small>
+                    </span>
+                    <dl>
+                      <div><dt>조회수</dt><dd>{a.data.views ?? a.data.viewCount ?? 0}</dd></div>
+                      <div><dt>시간당 조회</dt><dd>{a.data.views_per_hour ?? 0}</dd></div>
+                      <div><dt>좋아요율</dt><dd>{((a.data.like_rate || 0) * 100).toFixed(2)}%</dd></div>
+                      <div><dt>댓글률</dt><dd>{((a.data.comment_rate || 0) * 100).toFixed(2)}%</dd></div>
+                      <div><dt>평균 시청</dt><dd>{a.data.average_view_duration || 0}초</dd></div>
+                      <div><dt>평균 시청률</dt><dd>{a.data.average_percentage_viewed || 0}%</dd></div>
+                      <div><dt>구독자</dt><dd>+{a.data.subscriber_gain || 0}</dd></div>
+                    </dl>
+                    <strong>{a.data.verdict}</strong>
+                    <ul>{a.data.feedback?.map((line: string) => <li key={line}>{line}</li>)}</ul>
                   </div>
                 ))
               ) : (
@@ -1156,7 +1243,6 @@ export default function Page() {
                     <Plug size={16} />
                   </div>
                   {[
-                    "OPENAI_API_KEY",
                     "CLOUDFLARE_ACCOUNT_ID",
                     "CLOUDFLARE_API_TOKEN",
                     "GOOGLE_CLIENT_ID",
@@ -1208,6 +1294,32 @@ export default function Page() {
                     </div>
                   ))}
                   {office && (
+                    <div className="provider-test zero-cost-card">
+                      <div>
+                        <b>ZERO-COST STATUS</b>
+                        <small>Paid APIs: {zeroCostStatus?.paid_providers || "BLOCKED"} · Monetary spend: $0.00</small>
+                        <small>Ollama: {zeroCostStatus?.ollama || "CHECKING"} · {zeroCostStatus?.model || office.settings.ollama_model}</small>
+                        <small>Kokoro: {zeroCostStatus?.kokoro || "CHECKING"} · {zeroCostStatus?.voice || office.settings.kokoro_voice}</small>
+                        <small>Cloudflare Free: {zeroCostStatus?.cloudflare || "CHECKING"} · YouTube: {zeroCostStatus?.youtube || "CHECKING"} · FFmpeg: {zeroCostStatus?.ffmpeg || "CHECKING"}</small>
+                        {zeroCostStatus?.free_usage && <small>오늘: 이미지 {zeroCostStatus.free_usage.cloudflare_images_today}장 · Ollama {zeroCostStatus.free_usage.ollama_inferences_today}회 · Kokoro {zeroCostStatus.free_usage.kokoro_audio_seconds_today}초 · quota {zeroCostStatus.free_usage.quota_status}</small>}
+                      </div>
+                      <div>
+                        <button className="btn" disabled={busy} onClick={() => void act(async () => {
+                          await api("/api/system/test-llm-provider", "POST", { office_id: id });
+                          setZeroCostStatus(await api(`/api/system/zero-cost-status?office_id=${id}`));
+                        }, "Ollama local test passed")}>Test Ollama</button>
+                        <button className="btn" disabled={busy} onClick={() => void act(async () => {
+                          const result = await api("/api/system/test-tts-provider", "POST", { office_id: id });
+                          const c = config();
+                          const response = await fetch(c.url + result.preview_url, { headers: { Authorization: `Bearer ${c.token}` } });
+                          if (!response.ok) throw new Error("Voice preview unavailable");
+                          const url = URL.createObjectURL(await response.blob());
+                          const audio = new Audio(url); audio.onended = () => URL.revokeObjectURL(url); await audio.play();
+                        }, "Kokoro local voice test passed")}>Test Voice</button>
+                      </div>
+                    </div>
+                  )}
+                  {office && (
                     <div className="provider-test">
                       <div>
                         <b>Image provider test</b>
@@ -1222,7 +1334,7 @@ export default function Page() {
                           void act(async () => {
                             if (
                               !window.confirm(
-                                "Primary 공급자만 사용해 샘플 이미지 1장을 생성합니다. 이 테스트에서는 OpenAI fallback을 호출하지 않습니다. 공급자 사용량이 발생할 수 있습니다. 진행할까요?",
+                                "Cloudflare 무료 할당량으로 샘플 이미지 1장을 생성합니다. 유료 fallback은 코드에서 차단되어 있습니다. 진행할까요?",
                               )
                             )
                               return;
@@ -1665,8 +1777,8 @@ export default function Page() {
                           <Download size={15} /> Download MP4
                         </a>
                       )}
-                      {!detail.test_mode &&
-                        ["verify_facts", "approve", "reject"].map((action) => (
+                      {!detail.test_mode && detail.status === "REVIEW_REQUIRED" &&
+                        ["approve", "reject"].map((action) => (
                           <button
                             key={action}
                             className="btn"
@@ -1682,9 +1794,7 @@ export default function Page() {
                               }, "Review updated")
                             }
                           >
-                            {action === "verify_facts"
-                              ? "I verified the facts"
-                              : action === "approve"
+                            {action === "approve"
                                 ? "Approve"
                                 : "Reject"}
                           </button>
@@ -1712,7 +1822,7 @@ export default function Page() {
                           {label}
                         </button>
                       ))}
-                      {!detail.test_mode && detail.status === "APPROVED" && (
+                      {!detail.test_mode && ["READY", "APPROVED"].includes(detail.status) && (
                         <button
                           className="btn primary"
                           onClick={() => setModal("publish")}
@@ -1810,6 +1920,32 @@ export default function Page() {
   );
 }
 
+function VideoThumbnail({ officeId, video }: { officeId: string; video: RecordRow }) {
+  const [source, setSource] = useState("");
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    if (video.data.preview) {
+      previewUrl(officeId, video.id)
+        .then((url) => {
+          objectUrl = url;
+          if (active) setSource(url);
+        })
+        .catch(() => {});
+    }
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [officeId, video.id, video.data.preview]);
+  return (
+    <div className="video-cover">
+      {source ? <img src={source} alt="" /> : <Film size={38} />}
+      <span>{video.data.test_mode ? "TEST RUN" : "PRODUCTION"}</span>
+    </div>
+  );
+}
+
 function Stat({
   label,
   value,
@@ -1886,6 +2022,11 @@ function OfficeForm({
             direction: f.get("direction"),
             visual_source_mode: f.get("visual_source_mode"),
             visual_style_preset: f.get("visual_style_preset"),
+            zero_cost_mode: true,
+            llm_provider: "ollama",
+            ollama_model: f.get("ollama_model"),
+            tts_provider: "kokoro",
+            kokoro_voice: f.get("kokoro_voice"),
             image_provider: f.get("image_provider"),
             image_fallback_provider: f.get("image_fallback_provider"),
             cloudflare_image_model: f.get("cloudflare_image_model"),
@@ -1901,9 +2042,19 @@ function OfficeForm({
             upload_times: String(f.get("upload_times"))
               .split(",")
               .map((x) => x.trim()),
+            review_policy: f.get("review_policy"),
+            exploration_percentage: Number(f.get("exploration_percentage")),
+            youtube_trend_region: f.get("youtube_trend_region"),
+            topic_sources: String(f.get("topic_sources"))
+              .split(",")
+              .map((x) => x.trim())
+              .filter(Boolean),
+            missed_slot_delay_minutes: Number(f.get("missed_slot_delay_minutes")),
+            replacement_cutoff_minutes: Number(f.get("replacement_cutoff_minutes")),
+            max_replacements_per_slot: Number(f.get("max_replacements_per_slot")),
+            privacy: f.get("privacy"),
             daily_budget: Number(f.get("daily_budget")),
             monthly_budget: Number(f.get("monthly_budget")),
-            review_mode: f.get("review") === "on",
             auto_upload: f.get("auto_upload") === "on",
             category_weights: weights,
             freeze_weights: true,
@@ -1961,6 +2112,21 @@ function OfficeForm({
         외부 자료를 사용하며, 생성 실패를 임의 도형으로 대체하지 않습니다.
       </p>
       <fieldset>
+        <legend>Zero-cost local AI</legend>
+        <div className="form-grid">
+          <label>Local LLM provider<input value="Ollama" readOnly /></label>
+          <label>Ollama model<input name="ollama_model" defaultValue={s?.ollama_model || "qwen3:8b"} required /></label>
+          <label>Local TTS provider<input value="Kokoro" readOnly /></label>
+          <label>Kokoro voice
+            <select name="kokoro_voice" defaultValue={s?.kokoro_voice || "af_heart"}>
+              <option value="af_heart">af_heart</option><option value="af_bella">af_bella</option>
+              <option value="af_nicole">af_nicole</option><option value="am_michael">am_michael</option>
+            </select>
+          </label>
+        </div>
+        <p>유료 API는 차단됩니다. 로컬 공급자가 없으면 제작이 중단되어 비용이 발생하지 않습니다.</p>
+      </fieldset>
+      <fieldset>
         <legend>AI image provider</legend>
         <div className="form-grid">
           <label>
@@ -1970,17 +2136,14 @@ function OfficeForm({
               defaultValue={s?.image_provider || "cloudflare"}
             >
               <option value="cloudflare">Cloudflare Workers AI</option>
-              <option value="openai">OpenAI Images</option>
             </select>
           </label>
           <label>
             Fallback image provider
             <select
               name="image_fallback_provider"
-              defaultValue={s?.image_fallback_provider || "openai"}
+              defaultValue={s?.image_fallback_provider || "none"}
             >
-              <option value="openai">OpenAI Images</option>
-              <option value="cloudflare">Cloudflare Workers AI</option>
               <option value="none">Disabled</option>
             </select>
           </label>
@@ -2099,13 +2262,60 @@ function OfficeForm({
           <input name="timezone" defaultValue={s?.timezone || "UTC"} />
         </label>
         <label>
-          Production times
+          YouTube publish times
           <input
             name="upload_times"
             defaultValue={s?.upload_times?.join(",") || "09:00,15:00,21:00"}
           />
         </label>
+        <label>
+          Factory review policy
+          <select
+            name="review_policy"
+            defaultValue={s?.review_policy || "Review Exceptions Only"}
+          >
+            <option value="Review Everything">검증 후 업로드 · 모든 영상 검토</option>
+            <option value="Review Exceptions Only">예외만 검토 · 안전 영상 자동</option>
+            <option value="Fully Automatic">완전 자동 · 위험 영상은 차단</option>
+          </select>
+        </label>
+        <label>
+          YouTube visibility
+          <select name="privacy" defaultValue={s?.privacy || "private"}>
+            <option value="private">Private</option>
+            <option value="unlisted">Unlisted</option>
+            <option value="public">Public / scheduled</option>
+          </select>
+        </label>
+        <label>
+          Exploration percentage
+          <input name="exploration_percentage" type="number" min={0} max={100} defaultValue={s?.exploration_percentage ?? 15} />
+        </label>
+        <label>
+          YouTube trend region
+          <input name="youtube_trend_region" maxLength={2} defaultValue={s?.youtube_trend_region || "US"} />
+        </label>
+        <label>
+          Missed slot catch-up delay (minutes)
+          <input name="missed_slot_delay_minutes" type="number" min={5} max={1440} defaultValue={s?.missed_slot_delay_minutes || 30} />
+        </label>
+        <label>
+          Replacement cutoff (minutes)
+          <input name="replacement_cutoff_minutes" type="number" min={0} max={1440} defaultValue={s?.replacement_cutoff_minutes ?? 180} />
+        </label>
+        <label>
+          Max replacements per slot
+          <input name="max_replacements_per_slot" type="number" min={0} max={5} defaultValue={s?.max_replacements_per_slot ?? 2} />
+        </label>
       </div>
+      <label>
+        Topic sources (comma separated)
+        <textarea
+          name="topic_sources"
+          rows={2}
+          defaultValue={(s?.topic_sources || ["NASA", "NOAA", "USGS", "ScienceDaily", "Ars Technica", "YouTube Trends"]).join(", ")}
+        />
+      </label>
       <label>
         Category weights (total 100)
         <textarea
@@ -2124,14 +2334,6 @@ function OfficeForm({
           )}
           rows={5}
         />
-      </label>
-      <label className="checkbox">
-        <input
-          type="checkbox"
-          name="review"
-          defaultChecked={s?.review_mode ?? true}
-        />{" "}
-        CEO review before publishing
       </label>
       <label className="checkbox">
         <input

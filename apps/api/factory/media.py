@@ -107,7 +107,21 @@ def duration(path):
     import wave
 
     with wave.open(str(path), "rb") as wav:
-        return wav.getnframes() / wav.getframerate()
+        rate = wav.getframerate()
+        channels = wav.getnchannels()
+        width = wav.getsampwidth()
+        frames = wav.getnframes()
+    reported = frames / rate
+    actual_audio_bytes = max(0, Path(path).stat().st_size - 44)
+    reported_bytes = frames * channels * width
+    # Streaming WAV responses can legally leave the RIFF/data size as 0xffffffff.
+    # Python's wave module treats that sentinel as real frames; use the actual
+    # payload size when the header is impossible for the file on disk.
+    if reported > 600 or reported_bytes > actual_audio_bytes * 1.1:
+        reported = actual_audio_bytes / max(1, rate * channels * width)
+    if not 0 < reported <= 600:
+        raise RuntimeError("Narration WAV has an invalid duration")
+    return reported
 
 
 def ass_time(value):

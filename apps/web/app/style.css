@@ -1063,6 +1063,11 @@ footer a {
 .video-card {
   padding: 0 0 18px;
 }
+.video-open {
+  width: 100%;
+  text-align: left;
+  display: block;
+}
 .video-card h3 {
   font-size: 14px;
   line-height: 1.5;
@@ -1099,6 +1104,86 @@ footer a {
   font-size: 9px;
   letter-spacing: 2px;
 }
+.video-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.video-cover:has(img) span {
+  position: absolute;
+  padding: 4px 7px;
+  border-radius: 4px;
+  color: white;
+  background: #203126b8;
+  bottom: 10px;
+  left: 10px;
+}
+.video-cover {
+  position: relative;
+}
+.video-actions {
+  display: flex;
+  gap: 8px;
+  padding: 14px 14px 0;
+  border-top: 1px solid #edf0e9;
+  margin-top: 14px;
+}
+.video-actions .btn {
+  flex: 1;
+  justify-content: center;
+}
+.daily-plan {
+  padding: 20px;
+  border-bottom: 1px solid var(--line);
+  background: #f8faf4;
+}
+.daily-plan > div:first-child p,
+.plan-slots small {
+  color: #88957d;
+  font-size: 9px;
+}
+.plan-slots {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 15px;
+}
+.plan-slots article,
+.analytics-card {
+  border: 1px solid #dbe2d4;
+  border-radius: 9px;
+  padding: 13px;
+  background: white;
+}
+.plan-slots article > * {
+  display: block;
+  margin-bottom: 6px;
+}
+.analytics-card {
+  margin: 14px;
+  position: relative;
+}
+.analytics-card dl {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 14px 0;
+}
+.analytics-card dl div {
+  background: #f5f8f1;
+  padding: 9px;
+  border-radius: 6px;
+}
+.analytics-card dt { font-size: 8px; color: #87917d; }
+.analytics-card dd { margin: 4px 0 0; font-weight: 700; }
+.performance-score {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  font-size: 25px;
+  color: #5d7b51;
+}
+.performance-score small { font-size: 9px; }
 .report-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -1819,6 +1904,10 @@ details pre {
 }
 @media (max-width: 680px) {
   .report-summary {
+    grid-template-columns: 1fr;
+  }
+  .plan-slots,
+  .analytics-card dl {
     grid-template-columns: 1fr;
   }
 }

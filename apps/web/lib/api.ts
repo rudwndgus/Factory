@@ -26,7 +26,10 @@ export type Snapshot = {
   reports: RecordRow[];
   system_events: RecordRow[];
   cost_events: RecordRow[];
+  usage_events: RecordRow[];
   analytics_snapshots: RecordRow[];
+  daily_production_plans: RecordRow[];
+  performance_profiles: RecordRow[];
   errors: RecordRow[];
   youtube: { channel_id: string; channel_title: string } | null;
 };
@@ -86,5 +89,13 @@ export async function fileUrl(office: string, id: string) {
     headers: { Authorization: `Bearer ${c.token}` },
   });
   if (!r.ok) throw new Error("Video download unavailable");
+  return URL.createObjectURL(await r.blob());
+}
+export async function previewUrl(office: string, id: string) {
+  const c = config();
+  const r = await fetch(`${c.url}/api/offices/${office}/videos/${id}/preview`, {
+    headers: { Authorization: `Bearer ${c.token}` },
+  });
+  if (!r.ok) throw new Error("Video preview unavailable");
   return URL.createObjectURL(await r.blob());
 }

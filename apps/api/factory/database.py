@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -6,7 +7,7 @@ from contextlib import contextmanager
 from .config import DATA, DEFAULTS, ROLES
 
 DB = DATA / "factory.sqlite3"
-TABLES = "topics topic_sources research_claims videos video_scenes video_assets video_scripts job_attempts errors qc_checks rights_records uploads analytics_snapshots strategy_changes reports cost_events system_events system_inspections".split()
+TABLES = "topics topic_sources research_claims videos video_scenes video_assets video_scripts job_attempts errors qc_checks rights_records uploads analytics_snapshots strategy_changes reports cost_events usage_events system_events system_inspections daily_production_plans performance_profiles".split()
 
 
 @contextmanager
@@ -38,6 +39,7 @@ def migrate():
         CREATE TABLE IF NOT EXISTS oauth_states(state_hash TEXT PRIMARY KEY, office_id TEXT, expires REAL);
         CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, office_id TEXT REFERENCES offices(id), kind TEXT, status TEXT, stage INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, next_run REAL DEFAULT 0, payload TEXT, created REAL, updated REAL, error TEXT);
         CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status,next_run);
+        CREATE TABLE IF NOT EXISTS upload_claims(office_id TEXT NOT NULL, video_id TEXT NOT NULL, status TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(office_id,video_id));
         """)
         for table in TABLES:
             db.execute(
@@ -49,11 +51,36 @@ def migrate():
         db.execute("INSERT OR IGNORE INTO migrations VALUES(1,?)", (time.time(),))
         for row in db.execute("SELECT office_id,payload FROM office_settings").fetchall():
             settings = json.loads(row["payload"])
+            had_review_policy = "review_policy" in settings
             for key, value in DEFAULTS.items():
                 settings.setdefault(key, value)
+            if os.getenv("ZERO_COST_MODE", "true").lower() == "true":
+                settings.update(
+                    zero_cost_mode=True,
+                    llm_provider="ollama",
+                    tts_provider="kokoro",
+                    image_provider="cloudflare",
+                    image_fallback_provider="none",
+                    daily_budget=0.0,
+                    monthly_budget=0.0,
+                )
+            if not had_review_policy:
+                office_name = db.execute(
+                    "SELECT name FROM offices WHERE id=?", (row["office_id"],)
+                ).fetchone()[0]
+                if office_name == "Curiosity Room":
+                    settings["review_policy"] = "Review Exceptions Only"
+                else:
+                    settings["review_policy"] = (
+                        "Review Everything"
+                        if settings.get("review_mode", True)
+                        else "Fully Automatic"
+                    )
             db.execute("UPDATE office_settings SET payload=? WHERE office_id=?",
                        (json.dumps(settings), row["office_id"]))
-        db.execute("INSERT OR IGNORE INTO migrations VALUES(2,?)", (time.time(),))
+        db.execute("INSERT OR IGNORE INTO migrations VALUES(3,?)", (time.time(),))
+        db.execute("INSERT OR IGNORE INTO migrations VALUES(4,?)", (time.time(),))
+        db.execute("INSERT OR IGNORE INTO migrations VALUES(5,?)", (time.time(),))
     if not offices():
         create_office("Amazing Things", {})
 
@@ -78,13 +105,16 @@ def office(id):
 
 def create_office(name, settings):
     id = uid()
+    initial = DEFAULTS | settings
+    if name == "Curiosity Room" and "review_policy" not in settings:
+        initial["review_policy"] = "Review Exceptions Only"
     with connection() as db:
         db.execute(
             "INSERT INTO offices VALUES(?,?,?,?)", (id, name, "STOPPED", time.time())
         )
         db.execute(
             "INSERT INTO office_settings VALUES(?,?)",
-            (id, json.dumps(DEFAULTS | settings)),
+            (id, json.dumps(initial)),
         )
         db.executemany(
             "INSERT INTO employee_states VALUES(?,?,?,?,?,?)",

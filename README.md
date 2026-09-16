@@ -8,9 +8,10 @@
 - **Visual Style Preset** 기본값: cinematic, mysterious, educational, high-contrast, clean, visually striking.
 - AI First는 장면별 AI 이미지를 먼저 생성합니다. 실제 인물·공식 뉴스·정확한 제품·공식 사진 등 실제 자료가 필요한 장면은 외부 자료를 요구합니다. 실제 자료를 못 찾으면 AI로 사실을 위조하지 않고 차단합니다.
 - Mixed는 실자료 필수 장면 외에 장면 순서에 따라 AI/실자료 우선순위를 번갈아 적용합니다. Real First는 실자료를 먼저 찾고, 필수 실자료 장면이 아닐 때만 AI로 전환합니다.
-- 기본 이미지 공급자는 Cloudflare Workers AI `FLUX.1 Schnell`(4 steps)이며, OpenAI 이미지는 선택적 fallback입니다. 모든 공급자 결과는 렌더링용 PNG로 정규화합니다. 예산·모델 권한·결제 오류 시 임의 도형으로 대체하지 않습니다.
-- 웹앱의 **AI Test run**은 5개 장면의 실제 유료 이미지 생성 + 로컬 음성으로 `Why space is silent`를 만듭니다. 비용 확인창을 거치며 **업로드는 금지**됩니다. 기존 `scripts/test_run.py`는 무료 오프라인 기술 검사로 남겨둡니다.
-- Review room에서 장면별 AI/외부 출처, 프롬프트, 스타일을 확인하고 이미지를 개별 재생성할 수 있습니다. 재생성은 비용이 발생하고 MP4·QC를 다시 만듭니다.
+- 기본 이미지 공급자는 Cloudflare Workers AI `FLUX.1 Schnell`(4 steps)이며 fallback은 `none`입니다. 무료 할당량이 없으면 기다리고 유료 공급자로 전환하지 않습니다.
+- 일반 제작의 대본·분석은 로컬 Ollama, 음성은 로컬 Kokoro, 편집은 로컬 FFmpeg를 사용합니다. **금전 API 지출은 $0.00**입니다.
+- 웹앱의 **AI Test run**은 고정 검사 경로이며 **업로드가 금지**됩니다. 일반 제작에는 고정 주제·대본·가짜 조회수·가짜 업로드가 들어가지 않습니다.
+- Review room에서 장면별 AI/외부 출처, 프롬프트, 스타일을 확인하고 이미지를 개별 재생성할 수 있습니다. 재생성은 Cloudflare 무료 할당량을 사용합니다.
 - 영상마다 보고서 한 장이 생성되고, 그 안에 10개 부서의 수행 내용과 특이사항이 계속 정리됩니다. 대표가 **확인 완료**를 누르면 보고서는 정리함으로 이동합니다. 작업이 진행되는 동안 사무실 직원 전체가 움직이고, 일시정지·중단 시 멈춥니다. 이미 전송한 외부 요청은 즉시 취소/환불할 수 없습니다.
 
 ### 휴대폰과 회사 PC 서버
@@ -22,11 +23,23 @@ cd C:\Users\kjunghyun\Desktop\rud\Kyung\Factory
 powershell -ExecutionPolicy Bypass -File scripts/remote.ps1
 ```
 
-스크립트는 API가 꺼져 있으면 먼저 실행하고, Cloudflare Quick Tunnel 주소를 만든 뒤 GitHub의 `PUBLIC_API_URL` 변수와 Pages 배포를 갱신합니다. 배포가 끝나면 휴대폰에서 웹앱을 열고 owner 비밀번호로 로그인하면 됩니다. PC 재시작 후에는 주소가 바뀌므로 위 명령을 다시 실행하고 약 2분 기다려야 합니다. 장기적으로 주소를 고정하려면 Cloudflare 계정과 소유 도메인으로 Named Tunnel을 구성해야 합니다.
+스크립트는 API가 꺼져 있으면 먼저 실행하고, Cloudflare Quick Tunnel 주소를 만든 뒤 GitHub의 `PUBLIC_API_URL` 변수와 Pages 배포를 갱신합니다. 배포가 끝나면 휴대폰에서 웹앱을 열고 owner 비밀번호로 로그인하면 됩니다. Quick Tunnel은 개발용 임시 주소라 재시작할 때 바뀝니다.
+
+주소를 고정하려면 Cloudflare에 연결된 소유 도메인으로 **remotely-managed Named Tunnel**을 한 번 만드세요. Cloudflare 대시보드에서 공개 hostname을 `http://127.0.0.1:8000`에 연결하고, `.env`에 `CLOUDFLARE_TUNNEL_TOKEN`과 `FIXED_API_URL=https://선택한-호스트명`을 넣은 뒤 아래 명령을 사용합니다. 토큰은 로그나 명령행에 출력하지 않습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/remote-fixed.ps1
+```
+
+이후 PC를 재부팅해도 같은 주소를 쓰며 위 스크립트만 다시 실행하면 됩니다. PC 자체가 꺼져 있으면 GitHub 웹 화면은 열려도 제작 서버 기능은 동작하지 않습니다. Cloudflare 공식 절차는 [Tunnel 생성 및 공개 hostname 연결](https://developers.cloudflare.com/tunnel/get-started/)과 [Tunnel token](https://developers.cloudflare.com/tunnel/reference/tunnel-tokens/)을 참고하세요.
 
 외부 접속을 끄려면 `powershell -ExecutionPolicy Bypass -File scripts/remote-stop.ps1`을 실행합니다.
 
 회사 PC가 켜져 있고 Windows 사용자가 로그인되어 있으며, 인터넷·API·터널 프로세스가 실행 중이어야 합니다. 회사 보안 정책상 터널 프로그램 사용 허가가 필요한지는 사용자 또는 IT 담당자가 확인해야 합니다. API 키와 `.env`, `data`를 GitHub에 올리지 마세요.
+
+### 이 회사 PC 성능 설정
+
+확인된 사양은 Intel Core i5-14400(10코어/16스레드), RAM 8GB, Intel UHD 730 내장 그래픽입니다. CPU와 저장공간은 충분하지만 로컬 LLM에는 RAM이 병목입니다. 그래서 기본값을 `qwen3:4b`, 컨텍스트 4096, CPU thread 6, 동시 worker 1, idle keep-alive 2분으로 맞췄습니다. Office 여러 개를 동시에 RUNNING으로 두거나 Chrome/VS Code 창을 많이 띄운 상태에서는 페이지파일 때문에 버벅일 수 있습니다. 안정적인 상시 3편 제작에는 RAM 16GB 이상을 권장합니다. 8B 모델은 설치되어 있어도 현재 기본 경로에서는 사용하지 않습니다.
 
 작은 픽셀 사무실로 관리하는 실제 Shorts 제작 서버입니다. 각 사무실은 하나의 채널 작업공간이며, 직원의 상태는 SQLite에 저장된 제작 작업에서 갱신됩니다. Next.js 웹앱과 Python/FastAPI 제작 서버를 분리했습니다.
 
@@ -51,7 +64,7 @@ RSS topic → source evidence → script → storyboard → stills
 - 10명의 절차적 픽셀 직원, 클릭 상세, 실시간 상태, 확대/이동, CEO 보고서
 - NASA/ScienceDaily RSS 후보 수집, 원본 대본, 장면 구성, 출처/주장 저장
 - Wikimedia Commons의 CC0/Public domain 메타데이터 이미지, 선택적 Pexels, 직접 생성한 설명 그래픽 폴백
-- OpenAI 텍스트/TTS 어댑터, API 없이 실행 가능한 명시적 offline TEST RUN
+- Ollama 로컬 구조화 대본·연구·성과 해석, Kokoro 로컬 TTS, 명시적 offline TEST RUN
 - 1080×1920 MP4, Ken Burns 줌, 음성, 구간별 자막, 음량 정규화, 선택적 음악/SFX
 - 해상도·오디오·검은 화면·장시간 무음·자막·길이·권리·사실 확인 QC 게이트
 - 대본 수정, 단계/장면 재생성 API, 검토/승인/거절, 다운로드
@@ -67,6 +80,7 @@ Python 3.12+, Node.js 22+, PowerShell이 필요합니다. 로컬 FFmpeg 실행 �
 ```powershell
 cd C:\Users\kjunghyun\Desktop\rud\Kyung\Factory
 powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
+powershell -ExecutionPolicy Bypass -File scripts/setup-zero-cost.ps1
 powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
 ```
 
@@ -104,7 +118,7 @@ $env:PYTHONPATH='apps/api'
 
 ## Cloudflare FLUX 이미지 설정
 
-Curiosity Room의 기본 이미지 공급자는 Cloudflare Workers AI의 `@cf/black-forest-labs/flux-1-schnell`입니다. OpenAI 이미지는 fallback으로 선택했을 때만 호출됩니다.
+Curiosity Room의 기본 이미지 공급자는 Cloudflare Workers AI의 `@cf/black-forest-labs/flux-1-schnell`입니다. 유료 이미지 fallback은 없습니다.
 
 1. [Cloudflare Workers AI REST API 안내](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)에서 Cloudflare Dashboard → Workers AI → **Use REST API**로 이동합니다.
 2. **Create a Workers AI API Token**을 눌러 토큰을 생성합니다. 직접 권한을 지정하면 Account의 `Workers AI - Read`와 `Workers AI - Edit` 권한이 모두 필요합니다.
@@ -121,26 +135,26 @@ CLOUDFLARE_API_TOKEN=your-workers-ai-token
 CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-1-schnell
 CLOUDFLARE_IMAGE_STEPS=4
 CLOUDFLARE_IMAGE_FORMAT=jpg
-IMAGE_FALLBACK_PROVIDER=openai
+IMAGE_FALLBACK_PROVIDER=none
 IMAGE_PROVIDER_TIMEOUT_SECONDS=60
 ```
 
-기본 장면 수 상한은 영상당 5장입니다. 5–8개 내레이션 문장을 4–5개 연속 장면으로 묶고 각 이미지를 FFmpeg 줌·팬으로 여러 초간 사용합니다. 공급자 테스트도 실제 이미지 한 장을 생성하므로 Cloudflare 사용량에 포함될 수 있습니다. 무료 할당량/쿼터가 소진되면 명확한 오류를 표시하며, fallback이 활성화된 경우에만 OpenAI를 시도합니다.
+기본 장면 수 상한은 영상당 5장입니다. 5–8개 내레이션 문장을 4–5개 연속 장면으로 묶고 각 이미지를 FFmpeg 줌·팬으로 여러 초간 사용합니다. 공급자 테스트도 실제 이미지 한 장을 생성하므로 Cloudflare 사용량에 포함됩니다. 무료 할당량/쿼터가 소진되면 `WAITING_FOR_FREE_QUOTA`로 기다립니다. Cloudflare 문서 기준 무료 할당량은 하루 10,000 Neurons이고 00:00 UTC에 초기화됩니다. 무료 플랜을 유지해야 초과 사용이 유료 청구로 전환되지 않습니다.
 
-## OpenAI 설정
+## Zero Cost 로컬 AI 설정
 
-Settings → Integrations에서 `OPENAI_API_KEY` 저장 → Test로 인증 검증. 또는 `.env`에 입력하고 서버를 재시작하세요. 저장소/브라우저 번들에는 키를 넣지 않습니다.
+Ollama 설치 후 `scripts/setup-zero-cost.ps1`을 실행하면 설정된 모델을 확인/다운로드하고 프로젝트 가상환경에 Kokoro를 설치한 뒤 구조화 출력과 음성 샘플을 실제 검사합니다. 모델 파일은 Git 저장소가 아니라 각 프로그램의 로컬 캐시에 저장됩니다. eSpeak-NG가 없으면 공식 Windows x64 MSI를 설치하고 PowerShell을 다시 여세요.
 
 | 환경변수 | 용도 |
 | --- | --- |
 | `MASTER_KEY` | Fernet 암호화 키. 암호화 DB와 함께 안전하게 백업 |
 | `OWNER_PASSWORD` | 소유자 로그인 비밀번호, 16자 이상 |
-| `OPENAI_API_KEY` | 실제 대본과 음성 생성 |
-| `TEXT_MODEL` | 설정 가능한 텍스트 모델, 기본 `gpt-4.1-mini` |
-| `TTS_MODEL`, `TTS_VOICE` | 음성 모델/목소리, 기본 `gpt-4o-mini-tts` / `coral` |
-| `TEXT_CALL_RESERVATION_USD` | 텍스트 호출당 보수적 비용 예약, 기본 0.05 |
-| `VOICE_CALL_RESERVATION_USD` | 음성 호출당 보수적 비용 예약, 기본 0.03 |
-| `GLOBAL_DAILY_BUDGET`, `GLOBAL_MONTHLY_BUDGET` | 전체 사무실의 비용 예약 합계 제한 |
+| `ZERO_COST_MODE` | `true`이면 유료 공급자 호출과 금전 예약을 코드에서 강제 차단 |
+| `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | 로컬 Ollama 주소와 모델, 8GB RAM PC 기본 `qwen3:4b` |
+| `OLLAMA_NUM_CTX`, `OLLAMA_NUM_THREADS`, `OLLAMA_KEEP_ALIVE` | 메모리·CPU 제한, 기본 `4096` / `6` / `2m` |
+| `KOKORO_VOICE`, `KOKORO_LANG_CODE` | 로컬 음성, 기본 `af_heart` / `a` |
+| `IMAGE_PROVIDER`, `IMAGE_FALLBACK_PROVIDER` | `cloudflare` / `none` |
+| `GLOBAL_DAILY_BUDGET`, `GLOBAL_MONTHLY_BUDGET` | Zero Cost 기본값 `0` |
 | `DATA_DIR` | SQLite와 렌더 파일 저장 위치 |
 | `FFMPEG_PATH` | 별도 FFmpeg 실행 파일 경로, 선택 사항 |
 | `ALLOWED_ORIGINS` | 쉼표로 구분한 허용 웹앱 origin |
@@ -148,9 +162,7 @@ Settings → Integrations에서 `OPENAI_API_KEY` 저장 → Test로 인증 검�
 | `GOOGLE_REDIRECT_URI` | 실제 서버의 OAuth 콜백 URL |
 | `PEXELS_API_KEY` | 선택적 사진 검색 |
 
-요금은 모델에 따라 달라집니다. 이 버전의 비용 수치는 **설정한 보수적 예약액**이며 청구서와 동일하지 않습니다. 제공된 토큰 사용량은 대본 기록에 보관합니다. 모델을 변경하면 예약액도 조정하세요. 과금 호출 전에 SQLite 트랜잭션으로 전체/사무실별 일·월 한도를 검사합니다. 실패하거나 응답이 불확실한 호출의 예약액도 유지합니다.
-
-공식 API 참고: [텍스트 생성](https://platform.openai.com/docs/api-reference/chat/create), [음성 생성](https://platform.openai.com/docs/api-reference/audio/createSpeech).
+공식 참고: [Ollama 구조화 출력](https://docs.ollama.com/capabilities/structured-outputs), [Kokoro Python](https://github.com/hexgrad/kokoro), [Cloudflare Workers AI 가격·무료 할당량](https://developers.cloudflare.com/workers-ai/platform/pricing/).
 
 ## YouTube OAuth 및 업로드
 
@@ -218,20 +230,13 @@ npx playwright test
 
 첫 종단 테스트에서 실제 **38.35초 / 1080×1920 MP4**를 생성하고 오디오·자막·해상도·파일·길이·검은 화면·무음 검사를 통과했습니다.
 
-## 현재 한계와 후속 작업
+## 운영상 주의사항
 
-이번 리빌드는 실행/검증 가능한 V1 기반이며, 마스터 프롬프트의 모든 고급 기능이 완성된 상태는 아닙니다.
-
-- 사실 검증은 수집 증거 + 구조화된 주장 + CEO 확인입니다. 독립 다중 출처 자동 교차 검증과 의미 임베딩 중복 탐지는 후속 작업입니다.
-- 후보 점수 중 수집하지 않은 신호는 null입니다. 조회수/트렌드 점수/수익을 만들지 않습니다. 카테고리 비중은 저장되지만 적응형 샘플링/자동 전략 변경은 미구현입니다.
-- AI 이미지 생성과 Commons/Pexels 선택을 지원합니다. NASA/NOAA/USGS 전문 미디어 어댑터, 생성 이미지의 자동 사실 검증, R2는 후속 작업입니다. AI 생성 표시와 출처 기록은 법적 권리나 시각적 정확성을 보증하지 않습니다.
-- TTS는 장면별 실제 음성 길이로 자막 시간을 분할합니다. 단어별 forced alignment와 키워드 하이라이트는 미구현입니다.
-- 렌더러는 줌/중앙 crop/컷/자막/음량 정규화/선택적 음악·SFX를 지원합니다. 패럴랙스, 다양한 전환, 스마트 피사체 crop은 후속 작업입니다.
-- 일부 장면 교체 기능은 API로 제공되며 관리 UI의 세부 이미지/권리 편집과 로그 고급 필터는 추가 작업이 필요합니다.
-- 영상별 보고서는 실제 작업 기록을 한 장에 집계합니다. 학습형 전략 추천/변경/되돌리기, 수익 지표, HQ 전체 통합 비용 통계는 미구현입니다.
-- Docker 파일은 제공하지만 이 Windows 세션에서 Docker 엔진을 사용한 검증은 수행하지 않았습니다.
-
-권장 다음 단계: HTTPS 제작 서버 배포 → API/OAuth 설정 → 비공개 실영상 제작/검토/업로드 검증 → 다중 출처 팩트체크와 전략 학습 확장.
+- `$0.00` 보장은 `ZERO_COST_MODE=true`, Cloudflare **Workers Free 플랜**, 유료 AI Gateway/별도 과금 연결 없음이라는 운영 조건을 함께 요구합니다. 코드는 유료 fallback을 호출하지 않지만 Cloudflare 계정의 플랜 자체는 소유자가 관리합니다.
+- AI 생성 이미지와 출처 기록은 법적 권리나 시각적 정확성을 자동 보증하지 않습니다. 실제 기록이 필요한 장면은 공공 원본을 요구하고 찾지 못하면 검토/대체 대상으로 보냅니다.
+- 팩트체크는 검색된 공개 근거의 권위·독립 출처 일치로 판정합니다. Ollama의 설명만으로 `VERIFIED`를 부여하지 않습니다.
+- 단어별 forced alignment, 스마트 피사체 crop과 고급 패럴랙스는 아직 없습니다. 현재는 실제 장면별 음성 길이, 중앙 crop, 줌·팬, 자막을 사용합니다.
+- 회사 PC가 꺼지거나 로그아웃되어 Ollama·백엔드·터널이 중단되면 휴대폰 웹앱도 제작할 수 없습니다. 재부팅 후 `scripts/remote.ps1`을 다시 실행하세요.
 
 ## 문제 해결
 
@@ -239,7 +244,9 @@ npx playwright test
 - **BLOCKED**: 작업 오류 메시지에 표시된 API 설정, 예산 또는 QC 항목을 해결한 뒤 Retry stage.
 - **암호 해독 오류**: 기존 DB를 암호화한 `MASTER_KEY`를 복원하세요. 키를 새로 만들면 기존 자격증명을 읽을 수 없습니다.
 - **OAuth redirect mismatch**: Google Console과 서버 `GOOGLE_REDIRECT_URI`를 문자 단위로 맞추세요.
-- **음성 생성 실패**: TEST RUN에서는 Windows System.Speech 또는 Linux espeak-ng가 필요합니다. 일반 제작에는 OpenAI 설정이 필요합니다.
+- **LOCAL_LLM_UNAVAILABLE**: Ollama 서비스와 `.env`의 모델명이 일치하는지 `ollama list`로 확인하세요.
+- **LOCAL_TTS_UNAVAILABLE**: `scripts/setup-zero-cost.ps1`을 다시 실행하고 Kokoro 및 eSpeak-NG 설치를 확인하세요.
+- **WAITING_FOR_FREE_QUOTA**: Cloudflare 무료 할당량/용량이 돌아올 때까지 공장이 기다립니다. 유료 fallback은 없습니다.
 - **렌더링 실패**: FFmpeg 실행 여부/디스크 용량을 확인하고 `data/media/.../render*.log`를 확인하세요. 영상 길이가 목표 범위를 벗어나면 QC가 게시를 막습니다.
 
 ## 구조

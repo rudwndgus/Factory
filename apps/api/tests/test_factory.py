@@ -5,10 +5,20 @@ import io
 import pytest
 import httpx
 import logging
+import struct
 from urllib.parse import urlparse, parse_qs
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from factory import database as db, engine, reports, security, youtube
+from factory import (
+    analytics,
+    database as db,
+    engine,
+    planning,
+    reports,
+    security,
+    verification,
+    youtube,
+)
 from factory.providers import reserve, BudgetBlocked, similarity
 from factory.main import app
 
@@ -127,13 +137,14 @@ def test_cloudflare_quota_error_is_clear_and_sanitized(monkeypatch, tmp_path):
     monkeypatch.setattr(providers.httpx, "post", lambda *args, **kwargs: httpx.Response(
         429, json={"errors": [{"message": "quota exhausted token-secret"}]}
     ))
-    with pytest.raises(providers.ImageProviderFailure, match="quota/free allocation") as error:
+    with pytest.raises(providers.FreeQuotaWait, match="WAITING_FOR_FREE_QUOTA") as error:
         providers.CloudflareWorkersAIImageProvider(first(), "video").image("space", tmp_path / "x.png")
     assert "token-secret" not in str(error.value)
 
 
 def test_image_provider_fallback_is_explicit(monkeypatch, tmp_path):
     from factory import providers
+    monkeypatch.setenv("ZERO_COST_MODE", "false")
 
     calls = []
     class FakeProvider:
@@ -388,8 +399,15 @@ def test_retry_backoff_and_manual_retry(monkeypatch):
     assert job(j)["status"] == "QUEUED"
 
 
-def test_budget_hard_stop():
+def test_budget_hard_stop(monkeypatch):
+    monkeypatch.setenv("ZERO_COST_MODE", "false")
+    monkeypatch.setenv("GLOBAL_DAILY_BUDGET", "100")
+    monkeypatch.setenv("GLOBAL_MONTHLY_BUDGET", "100")
     id = first()
+    with db.connection() as connection:
+        settings = json.loads(connection.execute("SELECT payload FROM office_settings WHERE office_id=?", (id,)).fetchone()[0])
+        settings.update(daily_budget=3, monthly_budget=20)
+        connection.execute("UPDATE office_settings SET payload=? WHERE office_id=?", (json.dumps(settings), id))
     reserve(id, "v", "script", 2.9)
     with pytest.raises(BudgetBlocked):
         reserve(id, "v", "script", 0.2)
@@ -397,8 +415,15 @@ def test_budget_hard_stop():
 
 
 def test_global_budget(monkeypatch):
+    monkeypatch.setenv("ZERO_COST_MODE", "false")
     monkeypatch.setenv("GLOBAL_DAILY_BUDGET", "0.10")
-    reserve(first(), "v", "script", 0.08)
+    monkeypatch.setenv("GLOBAL_MONTHLY_BUDGET", "100")
+    office_id = first()
+    with db.connection() as connection:
+        settings = json.loads(connection.execute("SELECT payload FROM office_settings WHERE office_id=?", (office_id,)).fetchone()[0])
+        settings.update(daily_budget=3, monthly_budget=20)
+        connection.execute("UPDATE office_settings SET payload=? WHERE office_id=?", (json.dumps(settings), office_id))
+    reserve(office_id, "v", "script", 0.08)
     other = db.create_office("Two", {})["id"]
     with pytest.raises(BudgetBlocked):
         reserve(other, "v", "script", 0.08)
@@ -581,3 +606,326 @@ def test_office_api_rejects_foreign_video():
     b = db.create_office("B", {})["id"]
     db.put("videos", a, {"title": "A"}, "v", "v")
     assert client().get(f"/api/offices/{b}/videos/v").status_code == 404
+
+
+def seed_topics(office_id, count=5):
+    for index in range(count):
+        id = f"topic-{index}"
+        db.put(
+            "topics",
+            office_id,
+            {
+                "title": f"Surprising science subject number {index}",
+                "summary": f"Authoritative source material {index}",
+                "source_url": f"https://science.nasa.gov/example-{index}",
+                "provider": "NASA",
+                "status": "candidate",
+                "category": "Science / Space",
+                "source_authority": 0.98,
+                "discovered_at": 1_800_000_000,
+            },
+            id=id,
+        )
+
+
+def test_daily_plan_is_persistent_unique_and_restart_safe():
+    office_id = first()
+    seed_topics(office_id)
+    engine.set_mode(office_id, "RUNNING")
+    plan = planning.ensure_plan(office_id, now=1_800_000_000)
+    assert plan["target_video_count"] == 3
+    assert len(plan["publish_slots"]) == 3
+    assert len({slot["topic_id"] for slot in plan["publish_slots"]}) == 3
+    assert len({slot["job_id"] for slot in plan["publish_slots"]}) == 3
+    assert len({slot["scheduled_publish_at"] for slot in plan["publish_slots"]}) == 3
+    with db.connection() as connection:
+        original_jobs = connection.execute("SELECT count(*) FROM jobs").fetchone()[0]
+    db.migrate()
+    again = planning.ensure_plan(office_id, now=1_800_000_000)
+    with db.connection() as connection:
+        assert connection.execute("SELECT count(*) FROM jobs").fetchone()[0] == original_jobs
+    assert [slot["job_id"] for slot in again["publish_slots"]] == [
+        slot["job_id"] for slot in plan["publish_slots"]
+    ]
+
+
+def test_failed_daily_slot_gets_bounded_replacement():
+    office_id = first()
+    seed_topics(office_id, 6)
+    engine.set_mode(office_id, "RUNNING")
+    plan = planning.ensure_plan(office_id, now=1_800_000_000)
+    slot = plan["publish_slots"][0]
+    old_job = slot["job_id"]
+    video = next(row["data"] for row in db.rows("videos", office_id) if row["id"] == old_job)
+    video["status"] = "FAILED"
+    db.put("videos", office_id, video, old_job, old_job)
+    with db.connection() as connection:
+        connection.execute("UPDATE jobs SET status='FAILED' WHERE id=?", (old_job,))
+    replaced = planning.reconcile(office_id, plan, now=1_800_000_000)
+    replacement = replaced["publish_slots"][0]
+    assert replacement["job_id"] != old_job
+    assert replacement["replacement_count"] == 1
+    assert replaced["replacement_jobs"] == 1
+
+
+def test_content_media_block_gets_replacement_but_provider_block_does_not():
+    office_id = first()
+    seed_topics(office_id, 6)
+    engine.set_mode(office_id, "RUNNING")
+    plan = planning.ensure_plan(office_id, now=1_800_000_000)
+    first_slot, second_slot = plan["publish_slots"][:2]
+    with db.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET status='BLOCKED',error=? WHERE id=?",
+            ("Scene requires authentic external imagery", first_slot["job_id"]),
+        )
+        connection.execute(
+            "UPDATE jobs SET status='BLOCKED',error=? WHERE id=?",
+            ("Configure CLOUDFLARE_API_TOKEN", second_slot["job_id"]),
+        )
+    first_old, second_old = first_slot["job_id"], second_slot["job_id"]
+    result = planning.reconcile(office_id, plan, now=1_800_000_000)
+    assert result["publish_slots"][0]["job_id"] != first_old
+    assert result["publish_slots"][1]["job_id"] == second_old
+
+
+def test_fact_verification_requires_real_source_evidence():
+    claim = [{"claim": "Sound needs a medium", "source_url": "https://science.nasa.gov/a"}]
+    verified = verification.verify_claims(
+        claim,
+        [{"title": "NASA", "source_url": "https://science.nasa.gov/a"}],
+    )
+    assert verified["facts_verified"] is True
+    unsupported = verification.verify_claims([{"claim": "Unsupported"}], [])
+    assert unsupported["verification_status"] == "UNSUPPORTED"
+    assert unsupported["requires_review"] is True
+
+
+def test_video_card_approval_makes_video_ready_for_automatic_upload():
+    office_id = first()
+    engine.set_mode(office_id, "RUNNING")
+    db.put(
+        "videos",
+        office_id,
+        {
+            "id": "review-video",
+            "title": "Review me",
+            "test_mode": False,
+            "status": "REVIEW_REQUIRED",
+            "qc": {"audio": True, "rights": True, "facts": False},
+            "fact_check": {"requires_review": True},
+        },
+        "review-video",
+        "review-video",
+    )
+    response = client().post(
+        f"/api/offices/{office_id}/videos/review-video/review",
+        json={"action": "approve"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "READY" and body["facts_verified"] is True
+    assert body["fact_check"]["manual_override"] is True
+
+
+def test_ready_video_uses_persistent_publish_slot(monkeypatch):
+    office_id = first()
+    engine.set_mode(office_id, "RUNNING")
+    settings = db.office(office_id)["settings"] | {"privacy": "public", "auto_upload": True}
+    with db.connection() as connection:
+        connection.execute(
+            "UPDATE office_settings SET payload=? WHERE office_id=?",
+            (json.dumps(settings), office_id),
+        )
+    scheduled = "2030-01-01T15:00:00Z"
+    db.put(
+        "videos",
+        office_id,
+        {
+            "id": "ready-video",
+            "title": "Ready",
+            "test_mode": False,
+            "status": "READY",
+            "facts_verified": True,
+            "qc": {"audio": True, "rights": True, "facts": True},
+            "file": "ready.mp4",
+            "scheduled_publish_at": scheduled,
+        },
+        "ready-video",
+        "ready-video",
+    )
+    calls = []
+    monkeypatch.setattr(
+        youtube.OfficialYouTube,
+        "upload",
+        lambda self, video, path, privacy, publish_at: calls.append((privacy, publish_at))
+        or {"youtube_id": "youtube-real-id", "uploaded_at": time.time()},
+    )
+    engine.publish_approved()
+    assert calls == [("public", scheduled)]
+    result = next(row["data"] for row in db.rows("videos", office_id) if row["id"] == "ready-video")
+    assert result["status"] == "SCHEDULED"
+
+
+def test_upload_claim_blocks_a_second_process():
+    office_id = first()
+    youtube.claim_upload(office_id, "claim-video")
+    with pytest.raises(ValueError, match="already in progress or complete"):
+        youtube.claim_upload(office_id, "claim-video")
+    youtube.finish_upload_claim(office_id, "claim-video", "needs_reconciliation")
+    youtube.claim_upload(office_id, "claim-video")
+
+
+def test_analytics_creates_feedback_and_learning_profile():
+    office_id = first()
+    db.put(
+        "videos",
+        office_id,
+        {
+            "id": "performance-video",
+            "title": "Performance",
+            "category": "Science / Space",
+            "format": "Explanation",
+            "hook_style": "Question",
+            "actual_duration": 34,
+            "test_mode": False,
+        },
+        "performance-video",
+        "performance-video",
+    )
+    analyzed = analytics.process_snapshot(
+        office_id,
+        "performance-video",
+        {
+            "viewCount": 100,
+            "likeCount": 12,
+            "commentCount": 3,
+            "shares": 2,
+            "estimatedMinutesWatched": 40,
+            "averageViewDuration": 24,
+            "averageViewPercentage": 70,
+            "subscribersGained": 2,
+        },
+        uploaded_at=time.time() - 7 * 3600,
+    )
+    assert analyzed["views_per_hour"] > 0
+    assert 0 <= analyzed["performance_score"] <= 100
+    report = db.rows("reports", office_id, "performance-video")[0]["data"]
+    assert report["performance_sections"][0]["window"] == "6-hour"
+    assert db.rows("performance_profiles", office_id)
+
+
+def test_normal_job_never_uses_fixed_test_script():
+    office_id = first()
+    seed_topics(office_id, 1)
+    engine.set_mode(office_id, "RUNNING")
+    job_id = engine.enqueue(office_id, topic_id="topic-0")
+    engine.tick()
+    video = next(row["data"] for row in db.rows("videos", office_id) if row["id"] == job_id)
+    assert video["title"] != engine.TEST_SCRIPT["title"]
+    assert video["test_mode"] is False
+
+
+def test_streaming_wav_unknown_size_uses_actual_payload(tmp_path):
+    from factory import media
+
+    path = tmp_path / "streaming.wav"
+    samples = b"\x00\x00" * 24000
+    header = (
+        b"RIFF"
+        + struct.pack("<I", 0xFFFFFFFF)
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, 24000, 48000, 2, 16)
+        + b"data"
+        + struct.pack("<I", 0xFFFFFFFF)
+    )
+    path.write_bytes(header + samples)
+    assert media.duration(path) == pytest.approx(1.0, abs=0.01)
+
+
+def test_zero_cost_blocks_openai_even_when_key_exists(monkeypatch, tmp_path):
+    from factory import providers
+
+    monkeypatch.setenv("ZERO_COST_MODE", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-never-be-used")
+    monkeypatch.setattr(providers.httpx, "post", lambda *a, **k: pytest.fail("paid network call reached"))
+    with pytest.raises(providers.PaidProviderBlocked, match="ZERO_COST_MODE"):
+        providers.OpenAIImageProvider(first(), "v").image("space", tmp_path / "x.png")
+    with pytest.raises(providers.PaidProviderBlocked, match="ZERO_COST_MODE"):
+        providers.OpenAI(first(), "v").script({}, db.office(first())["settings"])
+
+
+def test_zero_cost_cloudflare_failure_never_falls_back(monkeypatch, tmp_path):
+    from factory import providers
+
+    calls = []
+    class Fake:
+        def __init__(self, name): self.name = name
+        def image(self, *_):
+            calls.append(self.name)
+            raise providers.ImageProviderFailure("free provider unavailable")
+    monkeypatch.setenv("ZERO_COST_MODE", "true")
+    monkeypatch.setattr(providers, "image_provider", lambda name, *args: Fake(name))
+    with pytest.raises(providers.ImageProviderFailure):
+        providers.generate_image("space", tmp_path / "x.png", first(), "v",
+                                 {"image_provider": "cloudflare", "image_fallback_provider": "openai"})
+    assert calls == ["cloudflare"]
+
+
+def test_zero_cost_monetary_reservation_is_impossible(monkeypatch):
+    from factory import providers
+
+    monkeypatch.setenv("ZERO_COST_MODE", "true")
+    with pytest.raises(providers.PaidProviderBlocked):
+        providers.reserve(first(), "v", "script", 0.01)
+    assert db.rows("cost_events", first()) == []
+
+
+def test_writer_uses_local_ollama_structured_output(monkeypatch):
+    from factory import providers
+
+    model = "qwen3:8b"
+    monkeypatch.setenv("ZERO_COST_MODE", "true")
+    monkeypatch.setenv("OLLAMA_MODEL", model)
+    monkeypatch.setattr(providers.httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"models": [{"name": model}]}, request=httpx.Request("GET", "http://ollama/api/tags")
+    ))
+    payload = {
+        "title": "Local title", "description": "Local description",
+        "category": "Science / Space", "format": "Explanation", "hook_style": "Question",
+        "sentences": ["One.", "Two.", "Three.", "Four.", "Five."],
+        "claims": [{"claim": "A", "source_url": "https://nasa.gov/a", "confidence": .9, "type": "fact"}],
+        "visuals": [{"prompt": f"scene {i}", "summary_ko": f"장면 {i}", "kind": "cinematic",
+                     "requires_real": False, "reason": "illustration"} for i in range(4)],
+    }
+    posted = []
+    def post(url, **kwargs):
+        posted.append((url, kwargs["json"]))
+        return httpx.Response(200, json={"response": json.dumps(payload)}, request=httpx.Request("POST", url))
+    monkeypatch.setattr(providers.httpx, "post", post)
+    result = providers.llm_provider(first(), "v", db.office(first())["settings"] | {"ollama_model": model}).script(
+        {"title": "Topic", "sources": []}, db.office(first())["settings"]
+    )
+    assert posted[0][0].endswith("/api/generate")
+    assert posted[0][1]["model"] == model and posted[0][1]["format"] == providers.SCRIPT_SCHEMA
+    assert result["provider"] == "Ollama local"
+
+
+def test_tts_uses_local_kokoro_and_writes_wav(monkeypatch, tmp_path):
+    import numpy as np
+    from factory import providers
+
+    class Audio:
+        def detach(self): return self
+        def cpu(self): return self
+        def numpy(self): return np.ones(2400, dtype=np.float32) * 0.1
+    class Result:
+        audio = Audio()
+    class Pipeline:
+        def __call__(self, *args, **kwargs): return iter([Result()])
+    provider = providers.KokoroTTSProvider(first(), "v", {"kokoro_voice": "af_heart"})
+    monkeypatch.setattr(provider, "_pipeline", lambda: Pipeline())
+    output = tmp_path / "voice.wav"
+    provider.speak("Local voice", output)
+    assert output.read_bytes()[:4] == b"RIFF"
+    assert db.rows("usage_events", first(), "v")[0]["data"]["provider"] == "kokoro"
